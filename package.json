@@ -1,13 +1,14 @@
 {
-  "name": "beu-notice-builder",
+  "name": "beu-discrepancy-report-builder",
   "version": "1.0.0",
+  "private": true,
   "main": "notice_builder.js",
   "scripts": {
-    "start": "node notice_builder.js"
+    "build": "node notice_builder.js"
   },
   "dependencies": {
-    "axios": "^1.7.7",
+    "axios": "^1.7.9",
     "cheerio": "^1.0.0",
-    "puppeteer": "^24.17.1"
+    "puppeteer": "^24.7.1"
   }
 }
