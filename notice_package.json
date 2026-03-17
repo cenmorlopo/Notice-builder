@@ -1,0 +1,13 @@
+{
+  "name": "beu-notice-builder",
+  "version": "1.0.0",
+  "main": "notice_builder.js",
+  "scripts": {
+    "start": "node notice_builder.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "cheerio": "^1.0.0",
+    "puppeteer": "^24.17.1"
+  }
+}
