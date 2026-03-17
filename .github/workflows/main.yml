@@ -6,6 +6,7 @@ on:
 jobs:
   build-notices:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     steps:
       - name: Checkout
@@ -17,27 +18,39 @@ jobs:
           node-version: 20
 
       - name: Install dependencies
-        run: npm install
+        run: npm install --no-fund --no-audit
 
       - name: Run notice builder
         run: node notice_builder.js
 
+      - name: Check generated files
+        run: |
+          test -f all_notices.html
+          test -f notice_log.txt
+          test -f notice_failed.txt
+
       - name: Upload HTML
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: all_notices_html
           path: all_notices.html
+          if-no-files-found: warn
 
       - name: Upload PDF
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: all_notices_pdf
           path: all_notices.pdf
+          if-no-files-found: warn
 
       - name: Upload logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: notice_logs
           path: |
             notice_log.txt
             notice_failed.txt
+          if-no-files-found: warn
