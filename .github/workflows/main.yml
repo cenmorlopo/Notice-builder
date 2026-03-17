@@ -1,20 +1,20 @@
-name: BEU Notice Builder
+name: Build BEU discrepancy PDF
 
 on:
   workflow_dispatch:
 
 concurrency:
-  group: beu-notice-builder
+  group: beu-discrepancy-pdf
   cancel-in-progress: false
 
 jobs:
-  build-notices:
+  build:
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -22,47 +22,41 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: '20'
+          cache: 'npm'
 
       - name: Install dependencies
         run: npm install
 
-      - name: Ensure output files exist
+      - name: Ensure input files exist
         run: |
-          touch notice_failed.txt
-          touch notice_log.txt
-          touch notice_manifest.txt
+          test -f penalty_calc_output.txt
+          test -f penalty_audit.txt
 
-      - name: Run notice builder
-        id: build
+      - name: Run builder
+        id: build_step
         continue-on-error: true
         run: node notice_builder.js
 
-      - name: Commit and push outputs
+      - name: Commit outputs
         if: always()
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add \
-            notice_summary.html \
-            notice_priority.html \
-            all_notices.html \
-            all_notices.pdf \
-            notice_manifest.txt \
-            notice_failed.txt \
-            notice_log.txt
+          for f in all_notices.html all_notices.pdf notice_failed.txt notice_log.txt; do
+            if [ -f "$f" ]; then
+              git add "$f"
+            fi
+          done
 
           git diff --cached --quiet && echo "No changes to commit." && exit 0
 
-          git commit -m "Auto-update: notice builder output"
+          git commit -m "Auto-update: BEU discrepancy PDF"
           git push
 
-      - name: Show build status
-        if: always()
+      - name: Fail workflow if builder failed
+        if: steps.build_step.outcome == 'failure'
         run: |
-          if [ "${{ steps.build.outcome }}" = "failure" ]; then
-            echo "Notice builder failed, but outputs were committed if any were produced."
-          else
-            echo "Notice builder completed successfully."
-          fi
+          echo "Builder failed. Check notice_log.txt and notice_failed.txt in repo."
+          exit 1
