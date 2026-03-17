@@ -1,4 +1,0 @@
-section | count
-summary | 1
-priority | 1
-student_notices | 1330
