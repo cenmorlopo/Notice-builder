@@ -135,24 +135,25 @@ function sortPenaltyRows(rows) {
   });
 }
 
-function fetchConfig() {
+function fetchConfig(timeoutMs = 30000) {
   return {
-    timeout: 30000,
+    timeout: timeoutMs,
+    maxRedirects: 5,
     headers: {
       'User-Agent': 'Mozilla/5.0',
-      'Accept-Language': 'en-US,en;q=0.9'
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Connection': 'keep-alive'
     },
     validateStatus: (status) => status >= 200 && status < 500
   };
 }
 
-async function fetchWithRetry(url, mode = 'html') {
-  const tries = 3;
-  let delay = 1200;
+async function fetchWithRetry(url, mode = 'html', timeoutMs = 30000, tries = 4) {
+  let delay = 2000;
 
   for (let i = 1; i <= tries; i += 1) {
     try {
-      const response = await axios.get(url, fetchConfig());
+      const response = await axios.get(url, fetchConfig(timeoutMs));
 
       if (response.status !== 200) {
         if (i === tries) return { ok: false, reason: `HTTP_${response.status}` };
@@ -907,7 +908,13 @@ async function main() {
       continue;
     }
 
-    const oldFetch = await fetchWithRetry(resolvedRow.old_result_url, 'html');
+    const oldFetch = await fetchWithRetry(
+      resolvedRow.old_result_url,
+      'html',
+      90000,
+      5
+    );
+
     if (!oldFetch.ok) {
       fs.appendFileSync(
         FILES.failed,
@@ -919,7 +926,13 @@ async function main() {
     }
 
     const newApiUrl = deriveNewApiUrl(resolvedRow);
-    const newFetch = await fetchWithRetry(newApiUrl, 'json');
+    const newFetch = await fetchWithRetry(
+      newApiUrl,
+      'json',
+      45000,
+      4
+    );
+
     if (!newFetch.ok) {
       fs.appendFileSync(
         FILES.failed,
