@@ -4,222 +4,227 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const puppeteer = require('puppeteer');
 
+const ROOT = __dirname;
 const FILES = {
-  calc: path.join(__dirname, 'penalty_calc_output.txt'),
-  audit: path.join(__dirname, 'penalty_audit.txt'),
-  summaryHtml: path.join(__dirname, 'notice_summary.html'),
-  allHtml: path.join(__dirname, 'all_notices.html'),
-  pdf: path.join(__dirname, 'all_notices.pdf'),
-  manifest: path.join(__dirname, 'notice_manifest.txt'),
-  failed: path.join(__dirname, 'notice_failed.txt'),
-  log: path.join(__dirname, 'notice_log.txt')
+  calc: path.join(ROOT, 'penalty_calc_output.txt'),
+  audit: path.join(ROOT, 'penalty_audit.txt'),
+  html: path.join(ROOT, 'all_notices.html'),
+  pdf: path.join(ROOT, 'all_notices.pdf'),
+  failed: path.join(ROOT, 'notice_failed.txt'),
+  log: path.join(ROOT, 'notice_log.txt')
 };
 
-const CONFIG = {
-  oldHtmlBase: 'http://results.beup.ac.in/ResultsBTech2ndSem2024_B2023Pub.aspx',
-  currentResult: {
-    year: '2025',
-    semester: 'II',
-    examHeld: 'November/2025'
-  },
-  timeoutMs: 30000,
-  maxRetries: 3,
-  retryDelayMs: 1500,
-  politeDelayMs: 250
+const DEFAULT_NEW = {
+  year: '2025',
+  semester: 'II',
+  examHeld: 'November/2025',
+  examName: 'B.Tech. 2nd Semester Examination, 2025 (Old)'
 };
 
 function ensureFile(filePath, defaultContent = '') {
-  if (!fs.existsSync(filePath)) {
-    fs.writeFileSync(filePath, defaultContent, 'utf8');
-  }
+  if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, defaultContent, 'utf8');
+}
+
+function resetOutputs() {
+  fs.writeFileSync(FILES.failed, '', 'utf8');
+  fs.writeFileSync(FILES.log, '', 'utf8');
 }
 
 function log(message) {
   const line = `[${new Date().toISOString()}] ${message}`;
   console.log(line);
-  fs.appendFileSync(FILES.log, line + '\n', 'utf8');
+  fs.appendFileSync(FILES.log, `${line}\n`, 'utf8');
 }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function esc(s) {
-  return String(s ?? '')
+function esc(value) {
+  return String(value ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
 }
 
-function splitMulti(v) {
-  return String(v || '')
+function splitPipe(line) {
+  return line.split('|').map((x) => x.trim());
+}
+
+function splitCsvField(value) {
+  return String(value || '')
     .split(',')
-    .map(x => x.trim())
+    .map((x) => x.trim())
     .filter(Boolean);
 }
 
-function parsePipeLine(line) {
-  return line.split('|').map(x => x.trim());
-}
-
-function parseNumber(raw) {
-  const cleaned = String(raw ?? '').replace(/[^\d.\-]/g, '');
-  const n = parseFloat(cleaned);
-  return Number.isFinite(n) ? n : null;
-}
-
-function buildOldUrl(regNo) {
-  return `${CONFIG.oldHtmlBase}?Sem=II&RegNo=${regNo}`;
-}
-
-function buildNewApiUrl(regNo) {
-  const u = new URL('https://beu-bih.ac.in/backend/v1/result/get-result');
-  u.searchParams.set('year', CONFIG.currentResult.year);
-  u.searchParams.set('redg_no', regNo);
-  u.searchParams.set('semester', CONFIG.currentResult.semester);
-  u.searchParams.set('exam_held', CONFIG.currentResult.examHeld);
-  return u.toString();
-}
-
-function buildNewFrontendUrl(regNo) {
-  const u = new URL('https://beu-bih.ac.in/result-three');
-  u.searchParams.set('name', 'B.Tech. 2nd Semester Examination, 2025 (Old)');
-  u.searchParams.set('semester', CONFIG.currentResult.semester);
-  u.searchParams.set('session', CONFIG.currentResult.year);
-  u.searchParams.set('regNo', regNo);
-  u.searchParams.set('exam_held', CONFIG.currentResult.examHeld);
-  return u.toString();
-}
-
-async function fetchWithRetries(url, expectJson = false) {
-  let delay = CONFIG.retryDelayMs;
-  for (let attempt = 1; attempt <= CONFIG.maxRetries; attempt++) {
-    try {
-      const response = await axios.get(url, {
-        timeout: CONFIG.timeoutMs,
-        headers: {
-          'User-Agent': 'Mozilla/5.0',
-          'Accept': expectJson ? 'application/json, text/plain, */*' : 'text/html,application/xhtml+xml'
-        },
-        validateStatus: status => status >= 200 && status < 500
-      });
-
-      if (response.status !== 200) {
-        return { kind: 'ERROR', error: `HTTP ${response.status}` };
-      }
-
-      if (expectJson) {
-        if (!response.data || response.data.status !== 200 || !response.data.data) {
-          return { kind: 'NO_RECORD' };
-        }
-        return { kind: 'FOUND', data: response.data.data };
-      }
-
-      if (typeof response.data === 'string' && !response.data.includes('No Record Found !!!')) {
-        return { kind: 'FOUND', html: response.data };
-      }
-      return { kind: 'NO_RECORD' };
-    } catch (error) {
-      if (attempt === CONFIG.maxRetries) {
-        return { kind: 'ERROR', error: error.message };
-      }
-      await sleep(delay);
-      delay *= 2;
-    }
-  }
-  return { kind: 'ERROR', error: 'Unknown fetch error' };
-}
-
-function loadPenaltyCalc() {
-  const raw = fs.readFileSync(FILES.calc, 'utf8')
+function readTextLines(filePath) {
+  return fs.readFileSync(filePath, 'utf8')
     .split(/\r?\n/)
-    .map(x => x.trim())
-    .filter(Boolean)
-    .filter(line => !/^reg_no\s*\|/i.test(line));
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
 
-  return raw.map(line => {
-    const p = parsePipeLine(line);
+function loadCalcRows() {
+  const lines = readTextLines(FILES.calc).filter((line) => !/^reg_no\s*\|/i.test(line));
+  return lines.map((line) => {
+    const p = splitPipe(line);
     return {
       reg_no: p[0] || '',
       branch_code: p[1] || '',
-      penalized_subject_codes: splitMulti(p[2] || ''),
-      subject_names: splitMulti(p[3] || ''),
-      old_shown_grades: splitMulti(p[4] || ''),
-      new_shown_grades: splitMulti(p[5] || ''),
-      should_be_grades: splitMulti(p[6] || ''),
+      penalized_subject_codes: splitCsvField(p[2] || ''),
+      subject_names: splitCsvField(p[3] || ''),
+      old_shown_grades: splitCsvField(p[4] || ''),
+      new_shown_grades: splitCsvField(p[5] || ''),
+      should_be_grades: splitCsvField(p[6] || ''),
       shown_sgpa: p[7] || '',
       corrected_sgpa: p[8] || '',
       shown_cgpa: p[9] || '',
       corrected_cgpa: p[10] || '',
-      status: p[11] || ''
+      status: p[11] || '',
+      old_result_url: p[12] || '',
+      new_result_url: p[13] || ''
     };
-  }).filter(x => x.reg_no);
+  });
 }
 
-function loadAudit() {
-  const raw = fs.readFileSync(FILES.audit, 'utf8')
-    .split(/\r?\n/)
-    .map(x => x.trim())
-    .filter(Boolean)
-    .filter(line => !/^reg_no\s*\|/i.test(line));
-
+function loadAuditMap() {
+  const lines = readTextLines(FILES.audit).filter((line) => !/^reg_no\s*\|/i.test(line));
   const byReg = new Map();
-  for (const line of raw) {
-    const p = parsePipeLine(line);
+
+  for (const line of lines) {
+    const p = splitPipe(line);
     const row = {
       reg_no: p[0] || '',
       sem: p[1] || '',
-      subject_code: p[2] || '',
-      subject_name: p[3] || '',
-      credit: p[4] || '',
-      old_shown_grade: p[5] || '',
-      new_shown_grade: p[6] || '',
-      should_be_grade: p[7] || '',
-      shown_gp: p[8] || '',
-      corrected_gp: p[9] || '',
-      delta_points: p[10] || ''
+      branch_code: p[2] || '',
+      subject_code: p[3] || '',
+      subject_name: p[4] || '',
+      subject_type: p[5] || '',
+      credit: p[6] || '',
+      old_shown_grade: p[7] || '',
+      new_shown_grade: p[8] || '',
+      should_be_grade: p[9] || '',
+      shown_gp: p[10] || '',
+      corrected_gp: p[11] || '',
+      delta_points: p[12] || '',
+      new_ese: p[13] || '',
+      new_ia: p[14] || '',
+      new_total: p[15] || '',
+      old_result_url: p[16] || '',
+      new_result_url: p[17] || ''
     };
+
     if (!byReg.has(row.reg_no)) byReg.set(row.reg_no, []);
     byReg.get(row.reg_no).push(row);
   }
+
   return byReg;
 }
 
-function parseOldHtml(html) {
-  const $ = cheerio.load(html);
+function sortPenaltyRows(rows) {
+  return [...rows].sort((a, b) => {
+    const aGroup = String(a.reg_no).startsWith('23') ? 0 : String(a.reg_no).startsWith('22') ? 1 : 2;
+    const bGroup = String(b.reg_no).startsWith('23') ? 0 : String(b.reg_no).startsWith('22') ? 1 : 2;
+    if (aGroup !== bGroup) return aGroup - bGroup;
+    return String(a.reg_no).localeCompare(String(b.reg_no));
+  });
+}
 
-  function label(id) {
-    return normalize($(`#${id}`).text());
-  }
+function normalizeText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
 
-  const meta = {
-    reg_no: label('ContentPlaceHolder1_DataList1_RegistrationNoLabel_0'),
-    student_name: label('ContentPlaceHolder1_DataList1_StudentNameLabel_0'),
-    father_name: label('ContentPlaceHolder1_DataList1_FatherNameLabel_0'),
-    mother_name: label('ContentPlaceHolder1_DataList1_MotherNameLabel_0'),
-    college_name: label('ContentPlaceHolder1_DataList1_CollegeNameLabel_0'),
-    course_name: label('ContentPlaceHolder1_DataList1_CourseLabel_0'),
-    exam_name: label('ContentPlaceHolder1_DataList4_Exam_Name_0'),
-    semester: label('ContentPlaceHolder1_DataList2_Exam_Name_0') || 'II',
-    exam_held: normalize($('#ContentPlaceHolder1_DataList2 td:nth-of-type(2)').text().split(':').pop()),
-    shown_sgpa: label('ContentPlaceHolder1_DataList5_GROSSTHEORYTOTALLabel_0'),
-    shown_cgpa: normalize($('#ContentPlaceHolder1_GridView3 tr:nth-child(2) td:last-child').text()),
-    remarks: normalize($('#ContentPlaceHolder1_lblRemarks').text()) || normalize($('body').text().match(/Remarks\s*:?\s*([^\n]+)/i)?.[1] || '')
+function fetchConfig() {
+  return {
+    timeout: 30000,
+    headers: {
+      'User-Agent': 'Mozilla/5.0',
+      'Accept-Language': 'en-US,en;q=0.9'
+    },
+    validateStatus: (status) => status >= 200 && status < 500
   };
+}
+
+async function fetchWithRetry(url, mode = 'html') {
+  const tries = 3;
+  let delay = 1200;
+  for (let i = 1; i <= tries; i += 1) {
+    try {
+      const response = await axios.get(url, fetchConfig());
+      if (response.status !== 200) {
+        if (i === tries) return { ok: false, reason: `HTTP_${response.status}` };
+      } else if (mode === 'html') {
+        const html = typeof response.data === 'string' ? response.data : '';
+        if (html && !/No Record Found/i.test(html)) return { ok: true, data: html };
+        return { ok: false, reason: 'NO_RECORD' };
+      } else {
+        return { ok: true, data: response.data };
+      }
+    } catch (error) {
+      if (i === tries) return { ok: false, reason: error.message };
+    }
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    delay *= 2;
+  }
+  return { ok: false, reason: 'UNKNOWN_FETCH_ERROR' };
+}
+
+function pickFirst(obj, keys, fallback = '') {
+  for (const key of keys) {
+    if (obj && obj[key] !== undefined && obj[key] !== null && String(obj[key]).trim() !== '') {
+      return obj[key];
+    }
+  }
+  return fallback;
+}
+
+function deriveNewApiInfo(row) {
+  try {
+    const url = new URL(row.new_result_url);
+    return {
+      year: url.searchParams.get('session') || DEFAULT_NEW.year,
+      semester: url.searchParams.get('semester') || DEFAULT_NEW.semester,
+      examHeld: url.searchParams.get('exam_held') || DEFAULT_NEW.examHeld,
+      frontendUrl: row.new_result_url || '',
+      examName: url.searchParams.get('name')
+        ? decodeURIComponent(url.searchParams.get('name')).replace(/\+/g, ' ')
+        : DEFAULT_NEW.examName
+    };
+  } catch (_error) {
+    return {
+      year: DEFAULT_NEW.year,
+      semester: DEFAULT_NEW.semester,
+      examHeld: DEFAULT_NEW.examHeld,
+      frontendUrl: row.new_result_url || '',
+      examName: DEFAULT_NEW.examName
+    };
+  }
+}
+
+function deriveNewApiUrl(row) {
+  const info = deriveNewApiInfo(row);
+  const url = new URL('https://beu-bih.ac.in/backend/v1/result/get-result');
+  url.searchParams.set('year', info.year);
+  url.searchParams.set('redg_no', row.reg_no);
+  url.searchParams.set('semester', info.semester);
+  url.searchParams.set('exam_held', info.examHeld);
+  return url.toString();
+}
+
+function parseOldHtml(html, fallbackOldUrl = '') {
+  const $ = cheerio.load(html);
+  const textById = (id) => normalizeText($(`#${id}`).text());
 
   const theory = [];
   $('#ContentPlaceHolder1_GridView1 tr').slice(1).each((_, el) => {
     const tds = $(el).find('td');
     if (tds.length >= 7) {
       theory.push({
-        code: normalize($(tds[0]).text()),
-        name: normalize($(tds[1]).text()),
-        ese: normalize($(tds[2]).text()),
-        ia: normalize($(tds[3]).text()),
-        total: normalize($(tds[4]).text()),
-        grade: normalize($(tds[5]).text()),
-        credit: normalize($(tds[6]).text())
+        code: normalizeText($(tds[0]).text()),
+        name: normalizeText($(tds[1]).text()),
+        ese: normalizeText($(tds[2]).text()),
+        ia: normalizeText($(tds[3]).text()),
+        total: normalizeText($(tds[4]).text()),
+        grade: normalizeText($(tds[5]).text()),
+        credit: normalizeText($(tds[6]).text())
       });
     }
   });
@@ -229,337 +234,371 @@ function parseOldHtml(html) {
     const tds = $(el).find('td');
     if (tds.length >= 7) {
       practical.push({
-        code: normalize($(tds[0]).text()),
-        name: normalize($(tds[1]).text()),
-        ese: normalize($(tds[2]).text()),
-        ia: normalize($(tds[3]).text()),
-        total: normalize($(tds[4]).text()),
-        grade: normalize($(tds[5]).text()),
-        credit: normalize($(tds[6]).text())
+        code: normalizeText($(tds[0]).text()),
+        name: normalizeText($(tds[1]).text()),
+        ese: normalizeText($(tds[2]).text()),
+        ia: normalizeText($(tds[3]).text()),
+        total: normalizeText($(tds[4]).text()),
+        grade: normalizeText($(tds[5]).text()),
+        credit: normalizeText($(tds[6]).text())
       });
     }
   });
 
-  return { meta, theory, practical };
-}
+  const cgpaCell = normalizeText($('#ContentPlaceHolder1_GridView3 tr').eq(1).find('td').last().text());
+  const examTitle = normalizeText($('#ContentPlaceHolder1_DataList4_Exam_Name_0').text());
+  const semester = textById('ContentPlaceHolder1_DataList2_Exam_Name_0') || 'II';
+  const remarks = textById('ContentPlaceHolder1_DataList3_remarkLabel_0') ||
+    normalizeText(($('body').text().match(/Remarks\s*:?\s*([^\n]+)/i) || [])[1]);
+  const examHeldText = normalizeText($('#ContentPlaceHolder1_DataList2 table tr td').eq(1).text());
+  const examHeld = normalizeText((examHeldText.split(':')[1] || examHeldText).replace(/\s+/g, ' '));
 
-function parseNewJson(data) {
-  const meta = {
-    reg_no: String(data.redg_no || ''),
-    student_name: String(data.name || ''),
-    father_name: String(data.father_name || ''),
-    mother_name: String(data.mother_name || ''),
-    college_name: String(data.college_name || ''),
-    course_name: String(data.course || ''),
-    exam_name: 'B.Tech. 2nd Semester Examination, 2025 (Old)',
-    semester: String(data.semester || 'II'),
-    exam_held: String(data.exam_held || ''),
-    shown_sgpa: String((data.sgpa && data.sgpa[1]) || ''),
-    shown_cgpa: String(data.cgpa || ''),
-    remarks: String(data.fail_any || '')
+  return {
+    old_url: fallbackOldUrl,
+    exam_name: examTitle || 'B.Tech. 2nd Semester Examination, 2024',
+    semester,
+    exam_held: examHeld || 'DEC/2024',
+    reg_no: textById('ContentPlaceHolder1_DataList1_RegistrationNoLabel_0'),
+    student_name: textById('ContentPlaceHolder1_DataList1_StudentNameLabel_0'),
+    course_name: `${textById('ContentPlaceHolder1_DataList1_CourseCodeLabel_0')}${textById('ContentPlaceHolder1_DataList1_CourseCodeLabel_0') ? ' - ' : ''}${textById('ContentPlaceHolder1_DataList1_CourseLabel_0')}`.trim(),
+    college_name: `${textById('ContentPlaceHolder1_DataList1_CollegeCodeLabel_0')}${textById('ContentPlaceHolder1_DataList1_CollegeCodeLabel_0') ? ' - ' : ''}${textById('ContentPlaceHolder1_DataList1_CollegeNameLabel_0')}`.trim(),
+    sgpa: textById('ContentPlaceHolder1_DataList5_GROSSTHEORYTOTALLabel_0'),
+    cgpa: cgpaCell,
+    remarks,
+    theory,
+    practical
   };
+}
 
-  const theory = (data.theorySubjects || []).map(s => ({
-    code: String(s.code || ''),
-    name: String(s.name || ''),
-    ese: String(s.ese || ''),
-    ia: String(s.ia || ''),
-    total: String(s.total || ''),
-    grade: String(s.grade || ''),
-    credit: String(s.credit || '')
+function getNewRoot(apiPayload) {
+  if (!apiPayload) return {};
+  if (apiPayload.data && typeof apiPayload.data === 'object') return apiPayload.data;
+  return apiPayload;
+}
+
+function pickArray(obj, keys) {
+  for (const key of keys) {
+    if (Array.isArray(obj?.[key])) return obj[key];
+  }
+  return [];
+}
+
+function parseNewJson(apiPayload, row) {
+  const root = getNewRoot(apiPayload);
+  const info = deriveNewApiInfo(row);
+
+  const theorySource = pickArray(root, ['theorySubjects', 'theory_subjects', 'theory', 'theory_subject']);
+  const practicalSource = pickArray(root, ['practicalSubjects', 'practical_subjects', 'practical', 'practical_subject']);
+
+  const theory = theorySource.map((s) => ({
+    code: normalizeText(pickFirst(s, ['code', 'subject_code'])),
+    name: normalizeText(pickFirst(s, ['name', 'subject_name'])),
+    ese: normalizeText(pickFirst(s, ['ese', 'ESE'])),
+    ia: normalizeText(pickFirst(s, ['ia', 'IA'])),
+    total: normalizeText(pickFirst(s, ['total', 'TOTAL'])),
+    grade: normalizeText(pickFirst(s, ['grade', 'GRADE'])),
+    credit: normalizeText(pickFirst(s, ['credit', 'CREDIT']))
   }));
 
-  const practical = (data.practicalSubjects || []).map(s => ({
-    code: String(s.code || ''),
-    name: String(s.name || ''),
-    ese: String(s.ese || ''),
-    ia: String(s.ia || ''),
-    total: String(s.total || ''),
-    grade: String(s.grade || ''),
-    credit: String(s.credit || '')
+  const practical = practicalSource.map((s) => ({
+    code: normalizeText(pickFirst(s, ['code', 'subject_code'])),
+    name: normalizeText(pickFirst(s, ['name', 'subject_name'])),
+    ese: normalizeText(pickFirst(s, ['ese', 'ESE'])),
+    ia: normalizeText(pickFirst(s, ['ia', 'IA'])),
+    total: normalizeText(pickFirst(s, ['total', 'TOTAL'])),
+    grade: normalizeText(pickFirst(s, ['grade', 'GRADE'])),
+    credit: normalizeText(pickFirst(s, ['credit', 'CREDIT']))
   }));
 
-  return { meta, theory, practical };
+  let sgpa = pickFirst(root, ['sgpa', 'SGPA']);
+  if (Array.isArray(sgpa)) sgpa = sgpa[1] || sgpa[0] || '';
+
+  return {
+    new_frontend_url: info.frontendUrl,
+    exam_name: info.examName,
+    semester: String(info.semester || DEFAULT_NEW.semester),
+    exam_held: String(info.examHeld || DEFAULT_NEW.examHeld),
+    reg_no: normalizeText(pickFirst(root, ['redg_no', 'reg_no', 'registration_no'], row.reg_no)),
+    student_name: normalizeText(pickFirst(root, ['name', 'student_name'])),
+    course_name: normalizeText(pickFirst(root, ['course', 'course_name'])),
+    college_name: normalizeText(pickFirst(root, ['college_name', 'college'])),
+    sgpa: normalizeText(sgpa),
+    cgpa: normalizeText(pickFirst(root, ['cgpa', 'current_cgpa', 'cur_cgpa'])),
+    remarks: normalizeText(pickFirst(root, ['fail_any', 'remarks'])),
+    theory,
+    practical
+  };
 }
 
-function normalize(v) {
-  return String(v || '').trim();
+function buildBadge(type, value) {
+  const safe = esc(value || '—');
+  if (type === 'published') return `<span class="penalty-grade">${safe}</span>`;
+  if (type === 'expected') return `<span class="real-grade">${safe}</span>`;
+  return `<span class="oval">${safe}</span>`;
 }
 
-function renderMetaBlock(meta) {
-  return `
-    <div class="meta-grid">
-      <div><b>Registration No:</b> ${esc(meta.reg_no)}</div>
-      <div><b>Student Name:</b> ${esc(meta.student_name)}</div>
-      <div><b>Father's Name:</b> ${esc(meta.father_name)}</div>
-      <div><b>Mother's Name:</b> ${esc(meta.mother_name)}</div>
-      <div><b>College Name:</b> ${esc(meta.college_name)}</div>
-      <div><b>Course Name:</b> ${esc(meta.course_name)}</div>
-      <div><b>Semester:</b> ${esc(meta.semester)}</div>
-      <div><b>Examination:</b> ${esc(meta.exam_held)}</div>
-    </div>
-  `;
-}
+function renderSubjectRows(subjects, penalizedSet, shouldMap, mode) {
+  return subjects.map((subject) => {
+    const isPenalized = penalizedSet.has(subject.code);
+    let gradeCell = esc(subject.grade || '');
+    let correctCell = '—';
 
-function renderResultTable(title, subjects, penalizedSet, shouldMap, mode) {
-  const rows = subjects.map(s => {
-    const isPen = penalizedSet.has(s.code);
-    const shownGrade = isPen ? `<span class="grade-oval">${esc(s.grade)}</span>` : esc(s.grade);
-    const shouldGrade = isPen && mode === 'new'
-      ? `<span class="grade-should">${esc(shouldMap.get(s.code) || '-')}</span>`
-      : '<span class="muted">—</span>';
+    if (isPenalized && mode === 'old') {
+      gradeCell = buildBadge('old', subject.grade);
+    }
+
+    if (isPenalized && mode === 'new') {
+      gradeCell = buildBadge('published', subject.grade);
+      correctCell = buildBadge('expected', shouldMap.get(subject.code) || '');
+    }
 
     return `
-      <tr class="${isPen ? 'row-issue' : ''}">
-        <td>${esc(s.code)}</td>
-        <td>${esc(s.name)}</td>
-        <td>${esc(s.ese)}</td>
-        <td>${esc(s.ia)}</td>
-        <td>${esc(s.total)}</td>
-        <td>${shownGrade}</td>
-        <td>${esc(s.credit)}</td>
-        <td>${shouldGrade}</td>
-      </tr>
-    `;
+      <tr class="${isPenalized ? (mode === 'old' ? 'fault-old' : 'fault-new') : ''}">
+        <td class="code">${esc(subject.code)}</td>
+        <td class="name">${esc(subject.name)}</td>
+        <td class="num">${esc(subject.ese)}</td>
+        <td class="num">${esc(subject.ia)}</td>
+        <td class="num">${esc(subject.total)}</td>
+        <td class="grade">${gradeCell}</td>
+        <td class="credit">${esc(subject.credit)}</td>
+        ${mode === 'new' ? `<td class="grade">${correctCell}</td>` : ''}
+      </tr>`;
   }).join('');
-
-  return `
-    <div class="result-section">
-      <h4>${esc(title)}</h4>
-      <table>
-        <thead>
-          <tr>
-            <th>Subject Code</th>
-            <th>Subject Name</th>
-            <th>ESE</th>
-            <th>IA</th>
-            <th>Total</th>
-            <th>Grade</th>
-            <th>Credit</th>
-            <th>Correct Grade</th>
-          </tr>
-        </thead>
-        <tbody>${rows}</tbody>
-      </table>
-    </div>
-  `;
 }
 
-function renderResultBlock(label, parsed, penalizedSet, shouldMap, mode, link) {
-  return `
-    <section class="report-box">
-      <div class="report-head">
-        <div>
-          <h3>${esc(label)}</h3>
-          <div class="subtitle">${esc(parsed.meta.exam_name || '')}</div>
-        </div>
-        <div class="link-box"><a href="${esc(link)}">Open Source</a></div>
-      </div>
-      ${renderMetaBlock(parsed.meta)}
-      ${renderResultTable(`${label} - Theory`, parsed.theory, penalizedSet, shouldMap, mode)}
-      ${renderResultTable(`${label} - Practical`, parsed.practical, penalizedSet, shouldMap, mode)}
-      <div class="sg-block">
-        <div><b>SGPA:</b> ${esc(parsed.meta.shown_sgpa)}</div>
-        <div><b>Current CGPA:</b> ${esc(parsed.meta.shown_cgpa)}</div>
-        <div><b>Remarks:</b> ${esc(parsed.meta.remarks)}</div>
-      </div>
-    </section>
-  `;
-}
+function renderCase(row, auditRows, oldData, newData) {
+  const penalizedSet = new Set(auditRows.map((x) => x.subject_code));
+  const shouldMap = new Map(auditRows.map((x) => [x.subject_code, x.should_be_grade]));
 
-function renderDiscrepancyTable(auditRows) {
-  const rows = auditRows.map(a => `
+  const oldTheoryRows = renderSubjectRows(oldData.theory, penalizedSet, shouldMap, 'old');
+  const oldPracticalRows = renderSubjectRows(oldData.practical, penalizedSet, shouldMap, 'old');
+  const newTheoryRows = renderSubjectRows(newData.theory, penalizedSet, shouldMap, 'new');
+  const newPracticalRows = renderSubjectRows(newData.practical, penalizedSet, shouldMap, 'new');
+
+  const summaryRows = auditRows.map((item) => `
     <tr>
-      <td>${esc(a.subject_code)}</td>
-      <td>${esc(a.subject_name)}</td>
-      <td>${esc(a.credit)}</td>
-      <td><span class="grade-oval">${esc(a.old_shown_grade)}</span></td>
-      <td><span class="grade-oval">${esc(a.new_shown_grade)}</span></td>
-      <td><span class="grade-should">${esc(a.should_be_grade)}</span></td>
-      <td>${esc(a.delta_points)}</td>
-    </tr>
-  `).join('');
+      <td class="code">${esc(item.subject_code)}</td>
+      <td class="name">${esc(item.subject_name)}</td>
+      <td class="credit">${esc(item.credit)}</td>
+      <td class="grade" style="background:#fff1e6;">${buildBadge('old', item.old_shown_grade)}</td>
+      <td class="grade" style="background:#fff8cc;">${buildBadge('published', item.new_shown_grade)}</td>
+      <td class="grade" style="background:#e8f7e8;">${buildBadge('expected', item.should_be_grade)}</td>
+    </tr>`).join('');
+
+  const displayedOldCgpa = oldData.cgpa || row.shown_cgpa || '';
+  const displayedOldRemarks = oldData.remarks || '';
+  const displayedNewRemarks = newData.remarks || '';
+
+  const sgpaIncrease = (Number(row.corrected_sgpa) - Number(row.shown_sgpa)).toFixed(2);
+  const cgpaIncrease = (Number(row.corrected_cgpa) - Number(row.shown_cgpa)).toFixed(2);
 
   return `
-    <section class="impact-panel">
-      <h3>Discrepancy Details</h3>
-      <table>
-        <thead>
-          <tr>
-            <th>Subject Code</th>
-            <th>Subject Name</th>
-            <th>Credit</th>
-            <th>Original Grade</th>
-            <th>Updated Shown Grade</th>
-            <th>Correct Grade</th>
-            <th>Delta Points</th>
-          </tr>
-        </thead>
-        <tbody>${rows}</tbody>
-      </table>
-    </section>
-  `;
-}
+    <div class="student-sheet" style="page-break-after:always;">
+      <div class="main-box top-merged">
+        <h1>Bihar Engineering University, Patna</h1>
+        <h2>Discrepancy Report</h2>
 
-function renderImpactBox(student) {
-  const shownS = parseNumber(student.shown_sgpa);
-  const corrS = parseNumber(student.corrected_sgpa);
-  const shownC = parseNumber(student.shown_cgpa);
-  const corrC = parseNumber(student.corrected_cgpa);
-  const dS = Number.isFinite(corrS - shownS) ? (corrS - shownS).toFixed(2) : '-';
-  const dC = Number.isFinite(corrC - shownC) ? (corrC - shownC).toFixed(2) : '-';
-
-  return `
-    <section class="impact-box">
-      <h3>Academic Impact After Removing Penalty</h3>
-      <div class="impact-grid">
-        <div><b>Shown SGPA:</b> ${esc(student.shown_sgpa)}</div>
-        <div><b>Corrected SGPA:</b> <span class="impact-value">${esc(student.corrected_sgpa)}</span></div>
-        <div><b>SGPA Increase:</b> ${esc(dS)}</div>
-        <div><b>Shown Current CGPA:</b> ${esc(student.shown_cgpa)}</div>
-        <div><b>Corrected Current CGPA:</b> <span class="impact-value">${esc(student.corrected_cgpa)}</span></div>
-        <div><b>CGPA Increase:</b> ${esc(dC)}</div>
-      </div>
-    </section>
-  `;
-}
-
-function renderCase(student, auditRows, oldParsed, newParsed) {
-  const penalizedSet = new Set(student.penalized_subject_codes);
-  const shouldMap = new Map(auditRows.map(a => [a.subject_code, a.should_be_grade]));
-  const oldUrl = buildOldUrl(student.reg_no);
-  const newUrl = buildNewFrontendUrl(student.reg_no);
-
-  const topMeta = newParsed.meta.student_name ? newParsed.meta : oldParsed.meta;
-
-  return `
-    <article class="case">
-      <div class="report-title">
-        <div class="report-title-main">Bihar Engineering University, Patna</div>
-        <div class="report-title-sub">Discrepancy Report - Original Result vs Updated Result</div>
-        <div class="report-reg"><b>Registration No:</b> ${esc(student.reg_no)} &nbsp; <b>Branch Code:</b> ${esc(student.branch_code)}</div>
+        <div class="top-meta">
+          <div class="meta-line">
+            <div><span class="label">Registration No:</span> ${esc(row.reg_no)}</div>
+            <div><span class="label">Student Name:</span> ${esc(newData.student_name || oldData.student_name)}</div>
+          </div>
+          <div class="meta-line">
+            <div><span class="label">Course Name:</span> ${esc(newData.course_name || oldData.course_name)}</div>
+            <div><span class="label">College Name:</span> ${esc(newData.college_name || oldData.college_name)}</div>
+          </div>
+        </div>
       </div>
 
-      <div class="identity-box">
-        <div><b>Student Name:</b> ${esc(topMeta.student_name)}</div>
-        <div><b>Father's Name:</b> ${esc(topMeta.father_name)}</div>
-        <div><b>Mother's Name:</b> ${esc(topMeta.mother_name)}</div>
-        <div><b>College:</b> ${esc(topMeta.college_name)}</div>
-        <div><b>Course:</b> ${esc(topMeta.course_name)}</div>
+      <div class="main-box">
+        <div class="sub-head">
+          <span>${esc(oldData.exam_name)} | Semester: ${esc(oldData.semester)} | Examination: ${esc(oldData.exam_held)}</span>
+          <a href="${esc(row.old_result_url)}">Click here to download</a>
+        </div>
+
+        <table>
+          <thead>
+            <tr>
+              <th class="code">Subject Code</th>
+              <th class="name">Subject Name</th>
+              <th class="num">ESE</th>
+              <th class="num">IA</th>
+              <th class="num">Total</th>
+              <th class="grade">Grade</th>
+              <th class="credit">Credit</th>
+            </tr>
+          </thead>
+          <tbody>${oldTheoryRows}</tbody>
+        </table>
+
+        <div class="sub-head"><span>Practical</span><span></span></div>
+        <table>
+          <thead>
+            <tr>
+              <th class="code">Subject Code</th>
+              <th class="name">Subject Name</th>
+              <th class="num">ESE</th>
+              <th class="num">IA</th>
+              <th class="num">Total</th>
+              <th class="grade">Grade</th>
+              <th class="credit">Credit</th>
+            </tr>
+          </thead>
+          <tbody>${oldPracticalRows}</tbody>
+        </table>
+
+        <div class="result-line">
+          SGPA: ${esc(oldData.sgpa || row.shown_sgpa)}
+          <span class="sep">|</span>
+          Current CGPA: ${esc(displayedOldCgpa)}
+          <span class="sep">|</span>
+          Remarks: <span style="color:#b00000;">${esc(displayedOldRemarks)}</span>
+        </div>
       </div>
 
-      ${renderResultBlock('Original Result', oldParsed, penalizedSet, shouldMap, 'old', oldUrl)}
-      ${renderResultBlock('Updated Result', newParsed, penalizedSet, shouldMap, 'new', newUrl)}
-      ${renderDiscrepancyTable(auditRows)}
-      ${renderImpactBox(student)}
-    </article>
-  `;
+      <div class="main-box">
+        <div class="sub-head">
+          <span>${esc(newData.exam_name)} | Semester: ${esc(newData.semester)} | Examination: ${esc(newData.exam_held)}</span>
+          <a href="${esc(row.new_result_url)}">Click here to download</a>
+        </div>
+
+        <table>
+          <thead>
+            <tr>
+              <th class="code">Subject Code</th>
+              <th class="name">Subject Name</th>
+              <th class="num">ESE</th>
+              <th class="num">IA</th>
+              <th class="num">Total</th>
+              <th class="grade">Result Grade</th>
+              <th class="credit">Credit</th>
+              <th class="grade">Correct Grade</th>
+            </tr>
+          </thead>
+          <tbody>${newTheoryRows}</tbody>
+        </table>
+
+        <div class="sub-head"><span>Practical</span><span></span></div>
+        <table>
+          <thead>
+            <tr>
+              <th class="code">Subject Code</th>
+              <th class="name">Subject Name</th>
+              <th class="num">ESE</th>
+              <th class="num">IA</th>
+              <th class="num">Total</th>
+              <th class="grade">Result Grade</th>
+              <th class="credit">Credit</th>
+              <th class="grade">Correct Grade</th>
+            </tr>
+          </thead>
+          <tbody>${newPracticalRows}</tbody>
+        </table>
+
+        <div class="result-line">
+          SGPA: ${esc(row.shown_sgpa)}
+          <span class="sep">|</span>
+          Current CGPA: ${esc(row.shown_cgpa)}
+          <span class="sep">|</span>
+          Remarks: <span style="color:#b00000;">${esc(displayedNewRemarks)}</span>
+        </div>
+      </div>
+
+      <div class="focus-box">
+        <div class="focus-head">Discrepancy Summary</div>
+        <div class="impact-pad">
+          <table class="summary-table">
+            <thead>
+              <tr>
+                <th style="width:12%;">Subject Code</th>
+                <th style="width:30%;">Subject Name</th>
+                <th style="width:10%;">Credit</th>
+                <th style="width:14%;">Previous Grade</th>
+                <th style="width:14%;">Published Grade</th>
+                <th style="width:20%;">Expected Grade</th>
+              </tr>
+            </thead>
+            <tbody>${summaryRows}</tbody>
+          </table>
+
+          <div class="impact-grid" style="margin-top:8px;border-top:1px solid #111;padding-top:8px;">
+            <div><b>Published SGPA:</b> <span class="metric-old">${esc(row.shown_sgpa)}</span></div>
+            <div><b>Corrected SGPA:</b> <span class="metric-corrected">${esc(row.corrected_sgpa)}</span></div>
+            <div><b>Increase:</b> <span class="metric-increase">${esc(sgpaIncrease)}</span></div>
+
+            <div><b>Published Current CGPA:</b> <span class="metric-old">${esc(row.shown_cgpa)}</span></div>
+            <div><b>Corrected Current CGPA:</b> <span class="metric-corrected">${esc(row.corrected_cgpa)}</span></div>
+            <div><b>Increase:</b> <span class="metric-increase">${esc(cgpaIncrease)}</span></div>
+          </div>
+        </div>
+      </div>
+    </div>`;
 }
 
-function buildPage(title, bodyHtml) {
+function buildHtmlDocument(content) {
   return `<!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>${esc(title)}</title>
+  <title>BEU Discrepancy Report</title>
   <style>
     @page { size: A4 portrait; margin: 8mm; }
-    body { font-family: Arial, Helvetica, sans-serif; color: #111; font-size: 10.2px; line-height: 1.25; }
-    h1,h2,h3,h4,p { margin: 0; }
-    .report-title { text-align: center; border: 2px solid #111; padding: 8px; margin-bottom: 8px; }
-    .report-title-main { font-size: 18px; font-weight: 700; }
-    .report-title-sub { font-size: 13px; font-weight: 700; margin-top: 4px; }
-    .report-reg { margin-top: 4px; font-size: 11px; }
-    .identity-box, .report-box, .impact-box, .impact-panel, .summary-card { border: 1.8px solid #111; padding: 8px; margin-bottom: 8px; }
-    .identity-box div { margin: 2px 0; }
-    .meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 10px; margin-top: 6px; }
-    .report-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 6px; }
-    .subtitle { font-size: 11px; font-weight: 700; margin-top: 2px; }
-    .link-box a { font-size: 10px; }
-    table { width: 100%; border-collapse: collapse; margin-top: 6px; }
-    th, td { border: 1px solid #333; padding: 3px 4px; vertical-align: top; }
-    th { background: #f1f1f1; font-size: 9.8px; }
-    .row-issue { background: #fff2cc; }
-    .grade-oval { display: inline-block; padding: 1px 8px; border: 2.5px solid #eab308; border-radius: 999px; background: #fff7cc; font-weight: 700; }
-    .grade-should { display: inline-block; padding: 1px 7px; border: 2.5px solid #16a34a; border-radius: 5px; background: #dcfce7; font-weight: 700; }
-    .impact-value { display: inline-block; padding: 1px 6px; border: 2px solid #b91c1c; background: #fee2e2; font-weight: 700; }
-    .impact-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 5px 10px; margin-top: 6px; }
-    .sg-block { display: grid; grid-template-columns: 1fr 1fr 2fr; gap: 6px; margin-top: 6px; border-top: 1px solid #aaa; padding-top: 6px; }
-    .muted { color: #777; }
-    .case { page-break-after: always; }
-    .toc li { margin-bottom: 2px; }
+    * { box-sizing: border-box; }
+    html, body { background:#e9e9e9; }
+    body{ margin:0; font-family:Arial, Helvetica, sans-serif; font-size:10.5px; color:#111; }
+    .page{ width:210mm; min-height:297mm; margin:0 auto; background:#fff; padding:8mm; box-sizing:border-box; }
+    .main-box{ border:2px solid #111; margin-bottom:8px; background:#fff; }
+    .top-merged{ text-align:center; padding:8px 8px 6px 8px; }
+    .top-merged h1{ margin:0; font-size:18px; font-weight:700; }
+    .top-merged h2{ margin:3px 0 2px 0; font-size:13px; font-weight:700; }
+    .top-meta{ margin-top:6px; text-align:left; border-top:1px solid #111; padding-top:6px; line-height:1.35; }
+    .meta-line{ display:grid; grid-template-columns: 1fr 1fr; gap:8px 18px; margin:2px 0; }
+    .label{ font-weight:700; }
+    .sub-head{ background:#efefef; border-bottom:1px solid #111; padding:4px 8px; font-weight:700; font-size:10.5px; display:flex; justify-content:space-between; align-items:center; gap:10px; line-height:1.15; }
+    .sub-head a{ color:#0a58ca; text-decoration:underline; white-space:nowrap; font-weight:700; font-size:10px; }
+    table{ width:100%; border-collapse:collapse; table-layout:fixed; margin:0; }
+    th, td{ border:1px solid #111; padding:4px 5px; vertical-align:top; word-wrap:break-word; }
+    th{ background:#f4f4f4; font-size:10px; font-weight:700; }
+    .summary-table th, .summary-table td{ padding:2px 5px; vertical-align:middle; line-height:1.1; }
+    .code{ width:12%; text-align:center; }
+    .name{ width:38%; }
+    .num{ width:8%; text-align:center; }
+    .grade{ width:11%; text-align:center; }
+    .credit{ width:10%; text-align:center; }
+    .fault-old{ background:#fff1e6; }
+    .fault-new{ background:#fff8cc; }
+    .oval{ display:inline-block; min-width:34px; padding:2px 10px; border:3px solid #d79b00; border-radius:999px; background:#fff0b8; font-weight:700; text-align:center; line-height:1.15; }
+    .real-grade{ display:inline-block; min-width:34px; padding:2px 10px; border:3px solid #1b8f3f; border-radius:6px; background:#dcf7e7; font-weight:700; text-align:center; line-height:1.15; }
+    .penalty-grade{ display:inline-block; min-width:34px; padding:2px 10px; border:3px solid #b00000; border-radius:6px; background:#ffe7e7; font-weight:700; text-align:center; line-height:1.15; }
+    .result-line{ border-top:1px solid #111; padding:4px 8px; font-size:10.2px; font-weight:700; text-align:center; line-height:1.1; word-spacing:1px; }
+    .sep{ display:inline-block; margin:0 18px; }
+    .focus-box{ border:2px solid #b00000; background:#fffaf9; margin-bottom:8px; }
+    .focus-head{ background:#b00000; color:#fff; font-weight:700; padding:4px 8px; font-size:11.5px; }
+    .impact-pad{ padding:5px 6px; }
+    .impact-grid{ display:grid; grid-template-columns:1fr 1fr 1fr; gap:4px 10px; padding:5px 0 0 0; font-size:10.5px; line-height:1.1; }
+    .metric-old{ display:inline-block; padding:1px 6px; border:2px solid #d97706; background:#ffedd5; border-radius:4px; font-weight:700; line-height:1; }
+    .metric-corrected{ display:inline-block; padding:1px 6px; border:2px solid #15803d; background:#dcfce7; border-radius:4px; font-weight:700; line-height:1; }
+    .metric-increase{ display:inline-block; padding:1px 6px; border:2px solid #2563eb; background:#dbeafe; border-radius:4px; font-weight:700; line-height:1; }
+    .student-sheet:last-child{ page-break-after:auto !important; }
+    @media print{
+      html, body{ background:#fff !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+      .page{ width:auto !important; min-height:auto !important; margin:0 !important; padding:0 !important; background:#fff !important; }
+      .main-box, .focus-box{ break-inside: avoid; page-break-inside: avoid; }
+    }
   </style>
 </head>
 <body>
-${bodyHtml}
+  <div class="page">${content}</div>
 </body>
 </html>`;
 }
 
-function summarize(calcRows, auditMap) {
-  const totalStudents = calcRows.length;
-  let totalSubjects = 0;
-  let totalDeltaSgpa = 0;
-  let totalDeltaCgpa = 0;
-  const branchCount = new Map();
-  const subjectCount = new Map();
-
-  for (const row of calcRows) {
-    totalSubjects += row.penalized_subject_codes.length;
-    branchCount.set(row.branch_code, (branchCount.get(row.branch_code) || 0) + 1);
-
-    const ds = parseNumber(row.corrected_sgpa) - parseNumber(row.shown_sgpa);
-    const dc = parseNumber(row.corrected_cgpa) - parseNumber(row.shown_cgpa);
-    if (Number.isFinite(ds)) totalDeltaSgpa += ds;
-    if (Number.isFinite(dc)) totalDeltaCgpa += dc;
-
-    const audits = auditMap.get(row.reg_no) || [];
-    for (const a of audits) {
-      subjectCount.set(a.subject_code, (subjectCount.get(a.subject_code) || 0) + 1);
-    }
-  }
-
-  return {
-    totalStudents,
-    totalSubjects,
-    avgDeltaSgpa: totalStudents ? (totalDeltaSgpa / totalStudents).toFixed(2) : '0.00',
-    avgDeltaCgpa: totalStudents ? (totalDeltaCgpa / totalStudents).toFixed(2) : '0.00',
-    topBranches: Array.from(branchCount.entries()).sort((a, b) => b[1] - a[1]).slice(0, 10),
-    topSubjects: Array.from(subjectCount.entries()).sort((a, b) => b[1] - a[1]).slice(0, 10)
-  };
-}
-
-function renderSummaryPage(summary) {
-  const branches = summary.topBranches.map(([code, count]) => `<tr><td>${esc(code)}</td><td>${esc(count)}</td></tr>`).join('');
-  const subjects = summary.topSubjects.map(([code, count]) => `<tr><td>${esc(code)}</td><td>${esc(count)}</td></tr>`).join('');
-
-  return buildPage('BEU Discrepancy Summary', `
-    <div class="report-title">
-      <div class="report-title-main">Bihar Engineering University, Patna</div>
-      <div class="report-title-sub">Summary of Grade Discrepancy Cases</div>
-    </div>
-    <div class="summary-card">
-      <div><b>Total Affected Students:</b> ${esc(summary.totalStudents)}</div>
-      <div><b>Total Penalized Subject Rows:</b> ${esc(summary.totalSubjects)}</div>
-      <div><b>Average SGPA Increase:</b> ${esc(summary.avgDeltaSgpa)}</div>
-      <div><b>Average CGPA Increase:</b> ${esc(summary.avgDeltaCgpa)}</div>
-    </div>
-    <div class="summary-card">
-      <h3>Top Branches</h3>
-      <table><thead><tr><th>Branch Code</th><th>Students</th></tr></thead><tbody>${branches}</tbody></table>
-    </div>
-    <div class="summary-card">
-      <h3>Top Subject Codes</h3>
-      <table><thead><tr><th>Subject Code</th><th>Count</th></tr></thead><tbody>${subjects}</tbody></table>
-    </div>
-  `);
-}
-
-async function renderPdfFromHtml(htmlPath, pdfPath) {
+async function renderPdf(htmlPath, pdfPath) {
   const browser = await puppeteer.launch({
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   });
+
   try {
     const page = await browser.newPage();
     await page.goto(`file://${htmlPath}`, { waitUntil: 'networkidle0' });
@@ -567,7 +606,8 @@ async function renderPdfFromHtml(htmlPath, pdfPath) {
       path: pdfPath,
       format: 'A4',
       printBackground: true,
-      margin: { top: '8mm', right: '6mm', bottom: '8mm', left: '6mm' }
+      preferCSSPageSize: true,
+      margin: { top: '0', right: '0', bottom: '0', left: '0' }
     });
   } finally {
     await browser.close();
@@ -575,67 +615,77 @@ async function renderPdfFromHtml(htmlPath, pdfPath) {
 }
 
 async function main() {
-  ensureFile(FILES.failed, '');
-  ensureFile(FILES.log, '');
-  ensureFile(FILES.manifest, '');
+  ensureFile(FILES.calc);
+  ensureFile(FILES.audit);
+  resetOutputs();
 
-  const calcRows = loadPenaltyCalc().filter(r => (r.status || '').toUpperCase().includes('PENALTY'));
-  const auditMap = loadAudit();
-  log(`Loaded ${calcRows.length} confirmed penalty students`);
+  const calcRows = sortPenaltyRows(
+    loadCalcRows().filter((row) => String(row.status).toUpperCase().includes('PENALTY_CONFIRMED'))
+  );
+  const auditMap = loadAuditMap();
 
-  const summaryHtml = renderSummaryPage(summarize(calcRows, auditMap));
-  fs.writeFileSync(FILES.summaryHtml, summaryHtml, 'utf8');
+  log(`Penalty rows loaded: ${calcRows.length}`);
 
-  const cases = [];
-  const manifest = [];
+  const rendered = [];
 
-  for (let i = 0; i < calcRows.length; i++) {
-    const student = calcRows[i];
-    const regNo = student.reg_no;
-    const oldUrl = buildOldUrl(regNo);
-    const newUrl = buildNewApiUrl(regNo);
+  for (let index = 0; index < calcRows.length; index += 1) {
+    const row = calcRows[index];
+    const auditRows = auditMap.get(row.reg_no) || [];
 
-    const oldFetched = await fetchWithRetries(oldUrl, false);
-    if (oldFetched.kind !== 'FOUND') {
-      fs.appendFileSync(FILES.failed, `${regNo} | OLD_FETCH_FAILED | ${oldUrl}\n`, 'utf8');
-      log(`[${i + 1}/${calcRows.length}] ${regNo} -> OLD_FETCH_FAILED`);
+    if (!auditRows.length) {
+      fs.appendFileSync(FILES.failed, `${row.reg_no} | NO_AUDIT_ROWS\n`, 'utf8');
+      log(`[${index + 1}/${calcRows.length}] ${row.reg_no} -> NO_AUDIT_ROWS`);
       continue;
     }
 
-    const newFetched = await fetchWithRetries(newUrl, true);
-    if (newFetched.kind !== 'FOUND') {
-      fs.appendFileSync(FILES.failed, `${regNo} | NEW_FETCH_FAILED | ${newUrl}\n`, 'utf8');
-      log(`[${i + 1}/${calcRows.length}] ${regNo} -> NEW_FETCH_FAILED`);
+    const oldFetch = await fetchWithRetry(row.old_result_url, 'html');
+    if (!oldFetch.ok) {
+      fs.appendFileSync(
+        FILES.failed,
+        `${row.reg_no} | OLD_FETCH_FAILED | ${row.old_result_url} | ${oldFetch.reason}\n`,
+        'utf8'
+      );
+      log(`[${index + 1}/${calcRows.length}] ${row.reg_no} -> OLD_FETCH_FAILED (${oldFetch.reason})`);
       continue;
     }
 
-    const oldParsed = parseOldHtml(oldFetched.html);
-    const newParsed = parseNewJson(newFetched.data);
-    const auditRows = auditMap.get(regNo) || [];
+    const newApiUrl = deriveNewApiUrl(row);
+    const newFetch = await fetchWithRetry(newApiUrl, 'json');
+    if (!newFetch.ok) {
+      fs.appendFileSync(
+        FILES.failed,
+        `${row.reg_no} | NEW_FETCH_FAILED | ${newApiUrl} | ${newFetch.reason}\n`,
+        'utf8'
+      );
+      log(`[${index + 1}/${calcRows.length}] ${row.reg_no} -> NEW_FETCH_FAILED (${newFetch.reason})`);
+      continue;
+    }
 
-    cases.push(renderCase(student, auditRows, oldParsed, newParsed));
-    manifest.push(`${regNo} | OK | ${oldUrl} | ${buildNewFrontendUrl(regNo)}`);
-    log(`[${i + 1}/${calcRows.length}] ${regNo} -> NOTICE_READY`);
-    await sleep(CONFIG.politeDelayMs);
+    try {
+      const oldData = parseOldHtml(oldFetch.data, row.old_result_url);
+      const newData = parseNewJson(newFetch.data, row);
+      rendered.push(renderCase(row, auditRows, oldData, newData));
+      log(`[${index + 1}/${calcRows.length}] ${row.reg_no} -> OK`);
+    } catch (error) {
+      fs.appendFileSync(FILES.failed, `${row.reg_no} | RENDER_FAILED | ${error.message}\n`, 'utf8');
+      log(`[${index + 1}/${calcRows.length}] ${row.reg_no} -> RENDER_FAILED (${error.message})`);
+    }
   }
 
-  const allHtml = buildPage('All Discrepancy Notices', `
-    <div class="report-title">
-      <div class="report-title-main">Bihar Engineering University, Patna</div>
-      <div class="report-title-sub">Consolidated Discrepancy Report</div>
-    </div>
-    ${cases.join('\n')}
-  `);
+  const fullHtml = buildHtmlDocument(rendered.join('\n'));
+  fs.writeFileSync(FILES.html, fullHtml, 'utf8');
+  log(`HTML written: ${FILES.html}`);
 
-  fs.writeFileSync(FILES.allHtml, allHtml, 'utf8');
-  fs.writeFileSync(FILES.manifest, manifest.join('\n') + '\n', 'utf8');
+  if (!rendered.length) {
+    log('No student pages rendered. PDF skipped.');
+    return;
+  }
 
-  log('Rendering final PDF...');
-  await renderPdfFromHtml(FILES.allHtml, FILES.pdf);
-  log(`PDF ready: ${FILES.pdf}`);
+  await renderPdf(FILES.html, FILES.pdf);
+  log(`PDF written: ${FILES.pdf}`);
 }
 
-main().catch(err => {
-  log(`FATAL ${err.stack || err.message}`);
+main().catch((error) => {
+  log(`FATAL: ${error.stack || error.message}`);
   process.exit(1);
 });
