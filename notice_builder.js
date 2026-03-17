@@ -1,496 +1,679 @@
-const axios = require('axios');
-const cheerio = require('cheerio');
-const fs = require('fs');
-const path = require('path');
-const puppeteer = require('puppeteer');
+const fs = require("fs");
+const path = require("path");
+const axios = require("axios");
+const cheerio = require("cheerio");
+const puppeteer = require("puppeteer");
 
 const FILES = {
-  output: path.join(__dirname, 'penalty_calc_output.txt'),
-  audit: path.join(__dirname, 'penalty_audit.txt'),
-  allHtml: path.join(__dirname, 'all_notices.html'),
-  allPdf: path.join(__dirname, 'all_notices.pdf'),
-  summaryHtml: path.join(__dirname, 'notice_summary.html'),
-  priorityHtml: path.join(__dirname, 'notice_priority.html'),
-  manifest: path.join(__dirname, 'notice_manifest.txt'),
-  failed: path.join(__dirname, 'notice_failed.txt'),
-  log: path.join(__dirname, 'notice_log.txt')
+  calc: path.join(__dirname, "penalty_calc_output.txt"),
+  audit: path.join(__dirname, "penalty_audit.txt"),
+  summaryHtml: path.join(__dirname, "notice_summary.html"),
+  priorityHtml: path.join(__dirname, "notice_priority.html"),
+  allHtml: path.join(__dirname, "all_notices.html"),
+  pdf: path.join(__dirname, "all_notices.pdf"),
+  manifest: path.join(__dirname, "notice_manifest.txt"),
+  failed: path.join(__dirname, "notice_failed.txt"),
+  log: path.join(__dirname, "notice_log.txt")
 };
 
 const CONFIG = {
+  oldHtmlBase: "http://results.beup.ac.in/ResultsBTech2ndSem2024_B2023Pub.aspx",
+  currentResult: {
+    year: "2025",
+    semester: "II",
+    examHeld: "November/2025"
+  },
   timeoutMs: 30000,
   maxRetries: 3,
   retryDelayMs: 1500,
-  pdf: {
-    format: 'A4',
-    margin: {
-      top: '10mm',
-      right: '10mm',
-      bottom: '10mm',
-      left: '10mm'
-    }
-  }
+  politeDelayMs: 300
 };
 
-function ensureFile(filePath, defaultContent = '') {
-  const dir = path.dirname(filePath);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, defaultContent, 'utf8');
+function ensureFile(filePath, defaultContent = "") {
+  if (!fs.existsSync(filePath)) {
+    fs.writeFileSync(filePath, defaultContent, "utf8");
+  }
 }
 
-function normalize(v) {
-  return String(v || '').trim();
-}
-
-function escapeHtml(v) {
-  return String(v || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+function log(message) {
+  const line = `[${new Date().toISOString()}] ${message}`;
+  console.log(line);
+  fs.appendFileSync(FILES.log, line + "\n", "utf8");
 }
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function log(message) {
-  const line = `[${new Date().toISOString()}] ${message}`;
-  console.log(line);
-  fs.appendFileSync(FILES.log, line + '\n', 'utf8');
+function esc(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
-function parseLine(line) {
-  return line.split('|').map(x => x.trim());
+function parseNumber(raw) {
+  const cleaned = String(raw ?? "").replace(/[^\d.]/g, "");
+  const n = parseFloat(cleaned);
+  return Number.isFinite(n) ? n : null;
 }
 
-function loadPenaltyOutput() {
-  const lines = fs.readFileSync(FILES.output, 'utf8')
-    .split(/\r?\n/)
+function splitMulti(v) {
+  return String(v || "")
+    .split(",")
     .map(x => x.trim())
-    .filter(Boolean)
-    .filter(line => !/^reg_no\s*\|/i.test(line));
-
-  return lines.map(line => {
-    const p = parseLine(line);
-    return {
-      reg_no: p[0],
-      branch_code: p[1],
-      penalized_subject_codes: normalize(p[2]).split(',').map(x => x.trim()).filter(Boolean),
-      subject_names: normalize(p[3]).split(',').map(x => x.trim()).filter(Boolean),
-      old_shown_grades: normalize(p[4]).split(',').map(x => x.trim()).filter(Boolean),
-      new_shown_grades: normalize(p[5]).split(',').map(x => x.trim()).filter(Boolean),
-      should_be_grades: normalize(p[6]).split(',').map(x => x.trim()).filter(Boolean),
-      shown_sgpa: normalize(p[7]),
-      corrected_sgpa: normalize(p[8]),
-      shown_cgpa: normalize(p[9]),
-      corrected_cgpa: normalize(p[10]),
-      status: normalize(p[11]),
-      old_result_url: normalize(p[12]),
-      new_result_url: normalize(p[13])
-    };
-  });
+    .filter(Boolean);
 }
 
-function loadPenaltyAudit() {
-  const lines = fs.readFileSync(FILES.audit, 'utf8')
-    .split(/\r?\n/)
-    .map(x => x.trim())
-    .filter(Boolean)
-    .filter(line => !/^reg_no\s*\|/i.test(line));
-
-  const grouped = new Map();
-
-  for (const line of lines) {
-    const p = parseLine(line);
-    const row = {
-      reg_no: p[0],
-      sem: p[1],
-      branch_code: p[2],
-      subject_code: p[3],
-      subject_name: p[4],
-      subject_type: p[5],
-      credit: p[6],
-      old_shown_grade: p[7],
-      new_shown_grade: p[8],
-      should_be_grade: p[9],
-      shown_gp: p[10],
-      corrected_gp: p[11],
-      delta_points: p[12],
-      new_ese: p[13],
-      new_ia: p[14],
-      new_total: p[15],
-      old_result_url: p[16],
-      new_result_url: p[17]
-    };
-
-    if (!grouped.has(row.reg_no)) grouped.set(row.reg_no, []);
-    grouped.get(row.reg_no).push(row);
-  }
-
-  return grouped;
+function parsePipeLine(line) {
+  return line.split("|").map(x => x.trim());
 }
 
-async function fetchWithRetries(url) {
+function buildOldUrl(regNo) {
+  return `${CONFIG.oldHtmlBase}?Sem=II&RegNo=${regNo}`;
+}
+
+function buildNewUrl(regNo) {
+  const u = new URL("https://beu-bih.ac.in/backend/v1/result/get-result");
+  u.searchParams.set("year", CONFIG.currentResult.year);
+  u.searchParams.set("redg_no", regNo);
+  u.searchParams.set("semester", CONFIG.currentResult.semester);
+  u.searchParams.set("exam_held", CONFIG.currentResult.examHeld);
+  return u.toString();
+}
+
+async function fetchWithRetries(url, expectJson = false) {
   let delay = CONFIG.retryDelayMs;
+
   for (let attempt = 1; attempt <= CONFIG.maxRetries; attempt++) {
     try {
       const response = await axios.get(url, {
         timeout: CONFIG.timeoutMs,
         headers: {
-          'User-Agent': 'Mozilla/5.0',
-          'Accept': 'text/html,application/xhtml+xml,application/json'
+          "User-Agent": "Mozilla/5.0",
+          "Accept": expectJson
+            ? "application/json, text/plain, */*"
+            : "text/html,application/xhtml+xml"
         },
         validateStatus: status => status >= 200 && status < 500
       });
 
-      if (response.status === 200) {
-        return { kind: 'FOUND', data: response.data };
+      if (response.status !== 200) {
+        return { kind: "ERROR", error: `HTTP ${response.status}` };
       }
-      return { kind: 'NO_RECORD', error: `HTTP ${response.status}` };
+
+      if (expectJson) {
+        if (!response.data || response.data.status !== 200 || !response.data.data) {
+          return { kind: "NO_RECORD" };
+        }
+        return { kind: "FOUND", data: response.data.data };
+      }
+
+      if (typeof response.data === "string" && !response.data.includes("No Record Found !!!")) {
+        return { kind: "FOUND", html: response.data };
+      }
+
+      return { kind: "NO_RECORD" };
     } catch (error) {
       if (attempt === CONFIG.maxRetries) {
-        return { kind: 'ERROR', error: error.message };
+        return { kind: "ERROR", error: error.message };
       }
       await sleep(delay);
       delay *= 2;
     }
   }
-  return { kind: 'ERROR', error: 'Unknown fetch error' };
+
+  return { kind: "ERROR", error: "Unknown fetch error" };
 }
 
-function parseOldResultMetaAndSubjects(html) {
+function parseOldHtml(html) {
   const $ = cheerio.load(html);
+
   const meta = {
-    student_name: normalize($('#ContentPlaceHolder1_DataList1_StudentNameLabel_0').text()),
-    college_name: normalize($('#ContentPlaceHolder1_DataList1_CollegeNameLabel_0').text()),
-    course_name: normalize($('#ContentPlaceHolder1_DataList1_CourseLabel_0').text()),
-    exam_name: normalize($('#ContentPlaceHolder1_DataList4_Exam_Name_0').text()),
-    semester: normalize($('#ContentPlaceHolder1_DataList2_Exam_Name_0').text()) || 'II',
-    old_sgpa: normalize($('#ContentPlaceHolder1_DataList5_GROSSTHEORYTOTALLabel_0').text()) || '',
-    old_cgpa: ''
+    reg_no: $("#ContentPlaceHolder1_DataList1_RegistrationNoLabel_0").text().trim() || "",
+    student_name: $("#ContentPlaceHolder1_DataList1_StudentNameLabel_0").text().trim() || "",
+    college_name: $("#ContentPlaceHolder1_DataList1_CollegeNameLabel_0").text().trim() || "",
+    course_name: $("#ContentPlaceHolder1_DataList1_CourseLabel_0").text().trim() || "",
+    shown_sgpa:
+      $("#ContentPlaceHolder1_DataList5_GROSSTHEORYTOTALLabel_0").text().trim() ||
+      "",
+    shown_cgpa:
+      $("#ContentPlaceHolder1_GridView3 tr:nth-child(2) td:last-child").text().trim() ||
+      ""
   };
 
-  $('#ContentPlaceHolder1_GridView3 tr:nth-child(2) td').each((index, cell) => {
-    if (index === 8) meta.old_cgpa = normalize($(cell).text());
-  });
-
-  const rows = [];
-  $('#ContentPlaceHolder1_GridView1 tr').slice(1).each((_, el) => {
-    const cells = $(el).find('td');
-    if (cells.length >= 7) {
-      rows.push({
-        subject_type: 'theory',
-        subject_code: normalize($(cells[0]).text()),
-        subject_name: normalize($(cells[1]).text()),
-        ese: normalize($(cells[2]).text()),
-        ia: normalize($(cells[3]).text()),
-        total: normalize($(cells[4]).text()),
-        grade: normalize($(cells[5]).text()),
-        credit: normalize($(cells[6]).text())
-      });
-    }
-  });
-  $('#ContentPlaceHolder1_GridView2 tr').slice(1).each((_, el) => {
-    const cells = $(el).find('td');
-    if (cells.length >= 7) {
-      rows.push({
-        subject_type: 'practical',
-        subject_code: normalize($(cells[0]).text()),
-        subject_name: normalize($(cells[1]).text()),
-        ese: normalize($(cells[2]).text()),
-        ia: normalize($(cells[3]).text()),
-        total: normalize($(cells[4]).text()),
-        grade: normalize($(cells[5]).text()),
-        credit: normalize($(cells[6]).text())
+  const theory = [];
+  $("#ContentPlaceHolder1_GridView1 tr").slice(1).each((_, el) => {
+    const tds = $(el).find("td");
+    if (tds.length >= 7) {
+      theory.push({
+        code: $(tds[0]).text().trim(),
+        name: $(tds[1]).text().trim(),
+        ese: $(tds[2]).text().trim(),
+        ia: $(tds[3]).text().trim(),
+        total: $(tds[4]).text().trim(),
+        grade: $(tds[5]).text().trim(),
+        credit: $(tds[6]).text().trim()
       });
     }
   });
 
-  return { meta, rows };
+  const practical = [];
+  $("#ContentPlaceHolder1_GridView2 tr").slice(1).each((_, el) => {
+    const tds = $(el).find("td");
+    if (tds.length >= 7) {
+      practical.push({
+        code: $(tds[0]).text().trim(),
+        name: $(tds[1]).text().trim(),
+        ese: $(tds[2]).text().trim(),
+        ia: $(tds[3]).text().trim(),
+        total: $(tds[4]).text().trim(),
+        grade: $(tds[5]).text().trim(),
+        credit: $(tds[6]).text().trim()
+      });
+    }
+  });
+
+  return { meta, theory, practical };
 }
 
-function css() {
+function parseNewJson(data) {
+  const meta = {
+    reg_no: String(data.redg_no || ""),
+    student_name: String(data.name || ""),
+    college_name: String(data.college_name || ""),
+    course_name: String(data.course || ""),
+    shown_sgpa: String((data.sgpa && data.sgpa[1]) || ""),
+    shown_cgpa: String(data.cgpa || "")
+  };
+
+  const theory = (data.theorySubjects || []).map(s => ({
+    code: String(s.code || ""),
+    name: String(s.name || ""),
+    ese: String(s.ese || ""),
+    ia: String(s.ia || ""),
+    total: String(s.total || ""),
+    grade: String(s.grade || ""),
+    credit: String(s.credit || "")
+  }));
+
+  const practical = (data.practicalSubjects || []).map(s => ({
+    code: String(s.code || ""),
+    name: String(s.name || ""),
+    ese: String(s.ese || ""),
+    ia: String(s.ia || ""),
+    total: String(s.total || ""),
+    grade: String(s.grade || ""),
+    credit: String(s.credit || "")
+  }));
+
+  return { meta, theory, practical };
+}
+
+function loadPenaltyCalc() {
+  const raw = fs.readFileSync(FILES.calc, "utf8")
+    .split(/\r?\n/)
+    .map(x => x.trim())
+    .filter(Boolean)
+    .filter(line => !/^reg_no\s*\|/i.test(line));
+
+  return raw.map(line => {
+    const p = parsePipeLine(line);
+    return {
+      reg_no: p[0] || "",
+      branch_code: p[1] || "",
+      penalized_subject_codes: splitMulti(p[2] || ""),
+      subject_names: splitMulti(p[3] || ""),
+      old_shown_grades: splitMulti(p[4] || ""),
+      new_shown_grades: splitMulti(p[5] || ""),
+      should_be_grades: splitMulti(p[6] || ""),
+      shown_sgpa: p[7] || "",
+      corrected_sgpa: p[8] || "",
+      shown_cgpa: p[9] || "",
+      corrected_cgpa: p[10] || "",
+      status: p[11] || ""
+    };
+  }).filter(x => x.reg_no);
+}
+
+function loadAudit() {
+  const raw = fs.readFileSync(FILES.audit, "utf8")
+    .split(/\r?\n/)
+    .map(x => x.trim())
+    .filter(Boolean)
+    .filter(line => !/^reg_no\s*\|/i.test(line));
+
+  const byReg = new Map();
+
+  for (const line of raw) {
+    const p = parsePipeLine(line);
+    const row = {
+      reg_no: p[0] || "",
+      sem: p[1] || "",
+      subject_code: p[2] || "",
+      subject_name: p[3] || "",
+      credit: p[4] || "",
+      old_shown_grade: p[5] || "",
+      new_shown_grade: p[6] || "",
+      should_be_grade: p[7] || "",
+      shown_gp: p[8] || "",
+      corrected_gp: p[9] || "",
+      delta_points: p[10] || ""
+    };
+    if (!byReg.has(row.reg_no)) byReg.set(row.reg_no, []);
+    byReg.get(row.reg_no).push(row);
+  }
+
+  return byReg;
+}
+
+function renderSubjectTable(title, subjects, penalizedSet, shouldMap, mode) {
+  const rows = subjects.map(s => {
+    const isPen = penalizedSet.has(s.code);
+    const should = shouldMap.get(s.code) || "";
+    const gradeCell = isPen
+      ? `<span class="${mode === "old" ? "old-grade" : "new-grade"}">${esc(s.grade)}</span>`
+      : esc(s.grade);
+
+    const shouldCell = mode === "new"
+      ? (isPen
+          ? `<span class="real-grade">${esc(should || "-")}</span>`
+          : `<span class="muted">-</span>`)
+      : (isPen ? `<span class="issue-note">Penalty source</span>` : `<span class="muted">-</span>`);
+
+    return `
+      <tr class="${isPen ? "pen-row" : ""}">
+        <td>${esc(s.code)}</td>
+        <td>${esc(s.name)}</td>
+        <td>${esc(s.ese)}</td>
+        <td>${esc(s.ia)}</td>
+        <td>${esc(s.total)}</td>
+        <td>${gradeCell}</td>
+        <td>${esc(s.credit)}</td>
+        <td>${shouldCell}</td>
+      </tr>
+    `;
+  }).join("");
+
   return `
-  @page { size: A4; margin: 10mm; }
-  body { font-family: Arial, sans-serif; margin: 0; color: #111; }
-  h1, h2, h3 { margin: 0 0 8px 0; }
-  .page { page-break-after: always; border: 1px solid #ddd; padding: 16px; margin-bottom: 18px; }
-  .meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 18px; margin: 10px 0 16px; }
-  .label { font-weight: 700; }
-  .section-title { margin-top: 12px; font-size: 18px; border-bottom: 2px solid #333; padding-bottom: 4px; }
-  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12px; }
-  th, td { border: 1px solid #bbb; padding: 6px 8px; vertical-align: top; }
-  th { background: #f2f2f2; }
-  .row-flag { background: #fff6cc; }
-  .oval-yellow { display: inline-block; padding: 2px 8px; border: 3px solid #f0c400; border-radius: 999px; font-weight: 700; background: #fffbe0; }
-  .box-green { display: inline-block; padding: 2px 8px; border: 3px solid #188038; border-radius: 6px; font-weight: 700; background: #eef9ef; }
-  .box-red { border: 3px solid #c5221f; background: #fff1f0; padding: 10px 12px; border-radius: 8px; margin-top: 12px; }
-  .impact-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px 16px; }
-  .small { color: #555; font-size: 12px; word-break: break-all; }
-  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #eef2ff; border: 1px solid #99a3ff; }
-  .kpi { display: inline-block; margin-right: 14px; margin-bottom: 8px; padding: 8px 12px; border-radius: 8px; background: #f6f8fa; border: 1px solid #ddd; }
-  .mono { font-family: Consolas, monospace; }
-  .front-page { page-break-after: always; padding: 8px 0 18px; }
-  ul { margin-top: 6px; }
+    <div class="section">
+      <h4>${esc(title)}</h4>
+      <table>
+        <thead>
+          <tr>
+            <th>Code</th>
+            <th>Subject</th>
+            <th>ESE</th>
+            <th>IA</th>
+            <th>Total</th>
+            <th>${mode === "old" ? "Old Grade" : "New Grade"}</th>
+            <th>Credit</th>
+            <th>${mode === "old" ? "Note" : "Should Be"}</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
   `;
 }
 
-function makeStudentPage(student, auditRows, oldMeta, oldRows) {
-  const codeSet = new Set(student.penalized_subject_codes);
-  const oldFiltered = oldRows.filter(r => codeSet.has(r.subject_code));
-  const sgpaDelta = (parseFloat(student.corrected_sgpa) - parseFloat(student.shown_sgpa)).toFixed(2);
-  const cgpaDelta = (parseFloat(student.corrected_cgpa) - parseFloat(student.shown_cgpa)).toFixed(2);
+function renderCase(student, auditRows, oldParsed, newParsed) {
+  const penalizedSet = new Set(student.penalized_subject_codes);
+  const shouldMap = new Map(auditRows.map(a => [a.subject_code, a.should_be_grade]));
 
-  const oldTableRows = oldFiltered.map(r => `
-    <tr class="row-flag">
-      <td>${escapeHtml(r.subject_code)}</td>
-      <td>${escapeHtml(r.subject_name)}</td>
-      <td>${escapeHtml(r.ese)}</td>
-      <td>${escapeHtml(r.ia)}</td>
-      <td>${escapeHtml(r.total)}</td>
-      <td><span class="oval-yellow">${escapeHtml(r.grade)}</span></td>
-      <td>${escapeHtml(r.credit)}</td>
-    </tr>
-  `).join('');
+  const oldTheory = renderSubjectTable("Old Result - Theory", oldParsed.theory, penalizedSet, shouldMap, "old");
+  const oldPractical = renderSubjectTable("Old Result - Practical", oldParsed.practical, penalizedSet, shouldMap, "old");
+  const newTheory = renderSubjectTable("New Result - Theory", newParsed.theory, penalizedSet, shouldMap, "new");
+  const newPractical = renderSubjectTable("New Result - Practical", newParsed.practical, penalizedSet, shouldMap, "new");
 
-  const newTableRows = auditRows.map(r => `
-    <tr class="row-flag">
-      <td>${escapeHtml(r.subject_code)}</td>
-      <td>${escapeHtml(r.subject_name)}</td>
-      <td>${escapeHtml(r.subject_type)}</td>
-      <td>${escapeHtml(r.new_ese)}</td>
-      <td>${escapeHtml(r.new_ia)}</td>
-      <td>${escapeHtml(r.new_total)}</td>
-      <td><span class="oval-yellow">${escapeHtml(r.new_shown_grade)}</span></td>
-      <td><span class="box-green">${escapeHtml(r.should_be_grade)}</span></td>
-      <td>${escapeHtml(r.credit)}</td>
-      <td>${escapeHtml(r.delta_points)}</td>
-    </tr>
-  `).join('');
+  const oldUrl = buildOldUrl(student.reg_no);
+  const newUrl = buildNewUrl(student.reg_no);
+
+  const penalizedList = auditRows.map(a =>
+    `<li><b>${esc(a.subject_code)}</b> — ${esc(a.subject_name)} | old ${esc(a.old_shown_grade)} → new shown ${esc(a.new_shown_grade)} → should be ${esc(a.should_be_grade)}</li>`
+  ).join("");
+
+  const deltaSgpa = (() => {
+    const a = parseNumber(student.shown_sgpa);
+    const b = parseNumber(student.corrected_sgpa);
+    return (a !== null && b !== null) ? (b - a).toFixed(2) : "-";
+  })();
+
+  const deltaCgpa = (() => {
+    const a = parseNumber(student.shown_cgpa);
+    const b = parseNumber(student.corrected_cgpa);
+    return (a !== null && b !== null) ? (b - a).toFixed(2) : "-";
+  })();
+
+  const meta = newParsed.meta.student_name || oldParsed.meta.student_name
+    ? {
+        student_name: newParsed.meta.student_name || oldParsed.meta.student_name,
+        college_name: newParsed.meta.college_name || oldParsed.meta.college_name,
+        course_name: newParsed.meta.course_name || oldParsed.meta.course_name
+      }
+    : {
+        student_name: "",
+        college_name: "",
+        course_name: ""
+      };
 
   return `
-  <div class="page">
-    <h2>Penalty Notice Case</h2>
-    <div class="meta-grid">
-      <div><span class="label">Registration No:</span> <span class="mono">${escapeHtml(student.reg_no)}</span></div>
-      <div><span class="label">Branch Code:</span> ${escapeHtml(student.branch_code)}</div>
-      <div><span class="label">Student Name:</span> ${escapeHtml(oldMeta.student_name || '-')}</div>
-      <div><span class="label">Course:</span> ${escapeHtml(oldMeta.course_name || '-')}</div>
-      <div><span class="label">College:</span> ${escapeHtml(oldMeta.college_name || '-')}</div>
-      <div><span class="label">Status:</span> <span class="pill">${escapeHtml(student.status)}</span></div>
-    </div>
-
-    <div class="section-title">Old Result: Faulty Subject(s)</div>
-    <table>
-      <thead>
-        <tr>
-          <th>Subject Code</th>
-          <th>Subject Name</th>
-          <th>ESE</th>
-          <th>IA</th>
-          <th>Total</th>
-          <th>Old Shown Grade</th>
-          <th>Credit</th>
-        </tr>
-      </thead>
-      <tbody>${oldTableRows || '<tr><td colspan="7">Old subject row not available.</td></tr>'}</tbody>
-    </table>
-
-    <div class="section-title">New Published Result vs Real Grade</div>
-    <table>
-      <thead>
-        <tr>
-          <th>Subject Code</th>
-          <th>Subject Name</th>
-          <th>Type</th>
-          <th>New ESE</th>
-          <th>New IA</th>
-          <th>New Total</th>
-          <th>New Shown Grade</th>
-          <th>Real Grade</th>
-          <th>Credit</th>
-          <th>Delta Points</th>
-        </tr>
-      </thead>
-      <tbody>${newTableRows}</tbody>
-    </table>
-
-    <div class="box-red">
-      <h3>Impact on SGPA / Current CGPA</h3>
-      <div class="impact-grid">
-        <div><span class="label">Shown SGPA:</span> <span class="oval-yellow">${escapeHtml(student.shown_sgpa)}</span></div>
-        <div><span class="label">Corrected SGPA:</span> <span class="box-green">${escapeHtml(student.corrected_sgpa)}</span></div>
-        <div><span class="label">Shown Current CGPA:</span> <span class="oval-yellow">${escapeHtml(student.shown_cgpa)}</span></div>
-        <div><span class="label">Corrected Current CGPA:</span> <span class="box-green">${escapeHtml(student.corrected_cgpa)}</span></div>
-        <div><span class="label">SGPA Increase:</span> ${escapeHtml(sgpaDelta)}</div>
-        <div><span class="label">CGPA Increase:</span> ${escapeHtml(cgpaDelta)}</div>
+    <article class="case">
+      <div class="case-header">
+        <div>
+          <h2>${esc(meta.student_name || "Student")}</h2>
+          <div class="meta">
+            <div><b>Reg No:</b> ${esc(student.reg_no)}</div>
+            <div><b>Branch Code:</b> ${esc(student.branch_code)}</div>
+            <div><b>Course:</b> ${esc(meta.course_name)}</div>
+            <div><b>College:</b> ${esc(meta.college_name)}</div>
+            <div><b>Status:</b> ${esc(student.status)}</div>
+          </div>
+        </div>
+        <div class="links">
+          <div><a href="${esc(oldUrl)}">Old Result Link</a></div>
+          <div><a href="${esc(newUrl)}">New Result Link</a></div>
+        </div>
       </div>
-    </div>
 
-    <p class="small">Old Result URL: ${escapeHtml(student.old_result_url)}</p>
-    <p class="small">New Result URL: ${escapeHtml(student.new_result_url)}</p>
-  </div>`;
+      <div class="impact-box">
+        <div><b>Penalized Subjects:</b> ${esc(student.penalized_subject_codes.join(", "))}</div>
+        <div><b>Shown SGPA:</b> ${esc(student.shown_sgpa)} &nbsp; <b>Corrected SGPA:</b> <span class="real-grade">${esc(student.corrected_sgpa)}</span> &nbsp; <b>Delta:</b> ${esc(deltaSgpa)}</div>
+        <div><b>Shown CGPA:</b> ${esc(student.shown_cgpa)} &nbsp; <b>Corrected CGPA:</b> <span class="real-grade">${esc(student.corrected_cgpa)}</span> &nbsp; <b>Delta:</b> ${esc(deltaCgpa)}</div>
+      </div>
+
+      <div class="issue-box">
+        <b>Comparison Summary</b>
+        <ul>${penalizedList}</ul>
+      </div>
+
+      ${oldTheory}
+      ${oldPractical}
+      ${newTheory}
+      ${newPractical}
+    </article>
+  `;
 }
 
-function buildSummaryHtml(students, auditMap) {
-  const totalStudents = students.length;
-  const totalSubjects = Array.from(auditMap.values()).reduce((a, rows) => a + rows.length, 0);
-  const branchCounts = new Map();
-  const subjectCounts = new Map();
-  let theory = 0;
-  let practical = 0;
-  let maxSgpa = -Infinity;
-  let maxCgpa = -Infinity;
-  let maxSgpaReg = '';
-  let maxCgpaReg = '';
+function buildPage(title, bodyHtml, extraHead = "") {
+  return `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>${esc(title)}</title>
+  <style>
+    @page { size: A4 portrait; margin: 12mm; }
+    body { font-family: Arial, Helvetica, sans-serif; color: #111; font-size: 12px; line-height: 1.35; }
+    h1, h2, h3, h4 { margin: 0 0 8px 0; }
+    .summary-card, .impact-box, .issue-box {
+      border: 2px solid #b91c1c;
+      border-radius: 8px;
+      padding: 10px;
+      margin: 10px 0;
+      background: #fff;
+    }
+    .case { page-break-after: always; border: 1px solid #ddd; padding: 10px; margin-bottom: 10px; }
+    .case-header { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+    .meta div, .links div { margin-bottom: 4px; }
+    table { width: 100%; border-collapse: collapse; margin: 8px 0 14px 0; }
+    th, td { border: 1px solid #444; padding: 4px 6px; vertical-align: top; }
+    th { background: #efefef; }
+    .pen-row { background: #fff7cc; }
+    .old-grade, .new-grade {
+      display: inline-block;
+      padding: 2px 10px;
+      border: 3px solid #eab308;
+      border-radius: 999px;
+      background: #fef3c7;
+      font-weight: 700;
+    }
+    .real-grade {
+      display: inline-block;
+      padding: 2px 8px;
+      border: 3px solid #16a34a;
+      border-radius: 6px;
+      background: #dcfce7;
+      font-weight: 700;
+    }
+    .issue-note {
+      display: inline-block;
+      padding: 2px 6px;
+      border: 2px dashed #d97706;
+      background: #fff7ed;
+      border-radius: 6px;
+      font-weight: 700;
+    }
+    .muted { color: #777; }
+    .section { margin-top: 8px; }
+    .toc li { margin-bottom: 3px; }
+    ${extraHead}
+  </style>
+</head>
+<body>
+${bodyHtml}
+</body>
+</html>`;
+}
 
-  for (const s of students) {
-    branchCounts.set(s.branch_code, (branchCounts.get(s.branch_code) || 0) + 1);
-    const sg = parseFloat(s.corrected_sgpa) - parseFloat(s.shown_sgpa);
-    const cg = parseFloat(s.corrected_cgpa) - parseFloat(s.shown_cgpa);
-    if (sg > maxSgpa) { maxSgpa = sg; maxSgpaReg = s.reg_no; }
-    if (cg > maxCgpa) { maxCgpa = cg; maxCgpaReg = s.reg_no; }
-  }
+function summarize(calcRows, auditMap) {
+  const totalStudents = calcRows.length;
+  let totalSubjects = 0;
+  let totalDeltaSgpa = 0;
+  let totalDeltaCgpa = 0;
+  const branchCount = new Map();
+  const subjectCount = new Map();
+  const multiCount = { one: 0, two: 0, threePlus: 0 };
 
-  for (const rows of auditMap.values()) {
-    for (const r of rows) {
-      if (r.subject_type === 'practical') practical += 1; else theory += 1;
-      subjectCounts.set(r.subject_code, (subjectCounts.get(r.subject_code) || 0) + 1);
+  for (const row of calcRows) {
+    const codes = row.penalized_subject_codes;
+    totalSubjects += codes.length;
+
+    if (codes.length === 1) multiCount.one++;
+    else if (codes.length === 2) multiCount.two++;
+    else if (codes.length >= 3) multiCount.threePlus++;
+
+    branchCount.set(row.branch_code, (branchCount.get(row.branch_code) || 0) + 1);
+
+    const ds = parseNumber(row.corrected_sgpa) - parseNumber(row.shown_sgpa);
+    const dc = parseNumber(row.corrected_cgpa) - parseNumber(row.shown_cgpa);
+    if (Number.isFinite(ds)) totalDeltaSgpa += ds;
+    if (Number.isFinite(dc)) totalDeltaCgpa += dc;
+
+    const auditRows = auditMap.get(row.reg_no) || [];
+    for (const a of auditRows) {
+      subjectCount.set(a.subject_code, (subjectCount.get(a.subject_code) || 0) + 1);
     }
   }
 
-  const topBranches = Array.from(branchCounts.entries()).sort((a,b)=>b[1]-a[1]).slice(0,10)
-    .map(([k,v]) => `<tr><td>${escapeHtml(k)}</td><td>${v}</td></tr>`).join('');
-  const topSubjects = Array.from(subjectCounts.entries()).sort((a,b)=>b[1]-a[1]).slice(0,10)
-    .map(([k,v]) => `<tr><td>${escapeHtml(k)}</td><td>${v}</td></tr>`).join('');
+  const topBranches = Array.from(branchCount.entries()).sort((a, b) => b[1] - a[1]).slice(0, 10);
+  const topSubjects = Array.from(subjectCount.entries()).sort((a, b) => b[1] - a[1]).slice(0, 10);
 
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Penalty Summary</title><style>${css()}</style></head><body>
-    <div class="front-page">
-      <h1>BEU Penalty Summary</h1>
-      <div class="kpi"><b>Total Students</b><br>${totalStudents}</div>
-      <div class="kpi"><b>Total Penalized Subject Rows</b><br>${totalSubjects}</div>
-      <div class="kpi"><b>Theory Rows</b><br>${theory}</div>
-      <div class="kpi"><b>Practical Rows</b><br>${practical}</div>
-      <div class="kpi"><b>Max SGPA Increase</b><br>${maxSgpa.toFixed(2)} (${escapeHtml(maxSgpaReg)})</div>
-      <div class="kpi"><b>Max CGPA Increase</b><br>${maxCgpa.toFixed(2)} (${escapeHtml(maxCgpaReg)})</div>
-
-      <h2>Top Branches</h2>
-      <table><thead><tr><th>Branch Code</th><th>Student Count</th></tr></thead><tbody>${topBranches}</tbody></table>
-
-      <h2>Top Penalized Subject Codes</h2>
-      <table><thead><tr><th>Subject Code</th><th>Count</th></tr></thead><tbody>${topSubjects}</tbody></table>
-    </div>
-  </body></html>`;
+  return {
+    totalStudents,
+    totalSubjects,
+    avgSubjectsPerStudent: totalStudents ? (totalSubjects / totalStudents).toFixed(2) : "0.00",
+    avgDeltaSgpa: totalStudents ? (totalDeltaSgpa / totalStudents).toFixed(2) : "0.00",
+    avgDeltaCgpa: totalStudents ? (totalDeltaCgpa / totalStudents).toFixed(2) : "0.00",
+    topBranches,
+    topSubjects,
+    multiCount
+  };
 }
 
-function buildPriorityHtml(students, auditMap) {
-  const rows = [];
-  for (const s of students) {
-    const subjectCount = (auditMap.get(s.reg_no) || []).length;
-    const sg = parseFloat(s.corrected_sgpa) - parseFloat(s.shown_sgpa);
-    const cg = parseFloat(s.corrected_cgpa) - parseFloat(s.shown_cgpa);
-    if (subjectCount >= 3 || sg >= 0.40 || cg >= 0.15) {
-      rows.push({ ...s, subjectCount, sg, cg });
-    }
-  }
+function renderSummaryPage(summary) {
+  const branchRows = summary.topBranches.map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`).join("");
+  const subjectRows = summary.topSubjects.map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`).join("");
 
-  rows.sort((a,b) => (b.subjectCount - a.subjectCount) || (b.sg - a.sg) || (b.cg - a.cg));
+  const body = `
+    <h1>BEU Penalty Comparison Summary</h1>
+    <div class="summary-card">
+      <div><b>Total Penalized Students:</b> ${esc(summary.totalStudents)}</div>
+      <div><b>Total Penalized Subject Rows:</b> ${esc(summary.totalSubjects)}</div>
+      <div><b>Average Penalized Subjects Per Student:</b> ${esc(summary.avgSubjectsPerStudent)}</div>
+      <div><b>Average SGPA Increase:</b> ${esc(summary.avgDeltaSgpa)}</div>
+      <div><b>Average CGPA Increase:</b> ${esc(summary.avgDeltaCgpa)}</div>
+      <div><b>1 Subject Cases:</b> ${esc(summary.multiCount.one)}</div>
+      <div><b>2 Subject Cases:</b> ${esc(summary.multiCount.two)}</div>
+      <div><b>3+ Subject Cases:</b> ${esc(summary.multiCount.threePlus)}</div>
+    </div>
 
-  const tr = rows.map(r => `
-    <tr>
-      <td>${escapeHtml(r.reg_no)}</td>
-      <td>${escapeHtml(r.branch_code)}</td>
-      <td>${r.subjectCount}</td>
-      <td>${r.sg.toFixed(2)}</td>
-      <td>${r.cg.toFixed(2)}</td>
-      <td>${escapeHtml(r.penalized_subject_codes.join(','))}</td>
-    </tr>
-  `).join('');
-
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Priority Cases</title><style>${css()}</style></head><body>
-    <div class="front-page">
-      <h1>Priority Penalty Cases</h1>
-      <p class="small">Students with 3+ penalized subjects or large SGPA/CGPA impact.</p>
+    <div class="summary-card">
+      <h3>Top Branches by Student Count</h3>
       <table>
-        <thead><tr><th>Reg No</th><th>Branch</th><th>Subject Count</th><th>SGPA Increase</th><th>CGPA Increase</th><th>Subject Codes</th></tr></thead>
-        <tbody>${tr}</tbody>
+        <thead><tr><th>Branch Code</th><th>Students</th></tr></thead>
+        <tbody>${branchRows}</tbody>
       </table>
     </div>
-  </body></html>`;
+
+    <div class="summary-card">
+      <h3>Top Subject Codes by Penalty Frequency</h3>
+      <table>
+        <thead><tr><th>Subject Code</th><th>Count</th></tr></thead>
+        <tbody>${subjectRows}</tbody>
+      </table>
+    </div>
+  `;
+
+  return buildPage("BEU Penalty Summary", body);
 }
 
-async function renderPdf(htmlPath, pdfPath) {
+function renderPriorityPage(calcRows, auditMap) {
+  const priorities = calcRows
+    .map(r => {
+      const ds = parseNumber(r.corrected_sgpa) - parseNumber(r.shown_sgpa);
+      const dc = parseNumber(r.corrected_cgpa) - parseNumber(r.shown_cgpa);
+      return { ...r, delta_sgpa: ds, delta_cgpa: dc, auditCount: (auditMap.get(r.reg_no) || []).length };
+    })
+    .filter(r => r.auditCount >= 3 || r.delta_sgpa >= 0.40 || r.delta_cgpa >= 0.15)
+    .sort((a, b) => (b.delta_sgpa || 0) - (a.delta_sgpa || 0));
+
+  const rows = priorities.map(r => `
+    <tr>
+      <td>${esc(r.reg_no)}</td>
+      <td>${esc(r.branch_code)}</td>
+      <td>${esc(r.penalized_subject_codes.join(", "))}</td>
+      <td>${esc(r.shown_sgpa)}</td>
+      <td>${esc(r.corrected_sgpa)}</td>
+      <td>${Number.isFinite(r.delta_sgpa) ? r.delta_sgpa.toFixed(2) : "-"}</td>
+      <td>${esc(r.shown_cgpa)}</td>
+      <td>${esc(r.corrected_cgpa)}</td>
+      <td>${Number.isFinite(r.delta_cgpa) ? r.delta_cgpa.toFixed(2) : "-"}</td>
+    </tr>
+  `).join("");
+
+  return buildPage("BEU Priority Cases", `
+    <h1>Priority Cases</h1>
+    <div class="summary-card">
+      <div>This file lists high-impact cases first.</div>
+      <div>Rule used: 3+ penalized subjects or SGPA delta ≥ 0.40 or CGPA delta ≥ 0.15</div>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Reg No</th>
+          <th>Branch</th>
+          <th>Penalized Subject Codes</th>
+          <th>Shown SGPA</th>
+          <th>Corrected SGPA</th>
+          <th>Δ SGPA</th>
+          <th>Shown CGPA</th>
+          <th>Corrected CGPA</th>
+          <th>Δ CGPA</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `);
+}
+
+async function renderPdfFromHtml(htmlPath, pdfPath) {
   const browser = await puppeteer.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
   });
   try {
     const page = await browser.newPage();
-    await page.goto(`file://${htmlPath}`, { waitUntil: 'networkidle0' });
-    await page.pdf({ path: pdfPath, printBackground: true, format: CONFIG.pdf.format, margin: CONFIG.pdf.margin });
+    await page.goto(`file://${htmlPath}`, { waitUntil: "networkidle0" });
+    await page.pdf({
+      path: pdfPath,
+      format: "A4",
+      printBackground: true,
+      margin: { top: "10mm", right: "8mm", bottom: "10mm", left: "8mm" }
+    });
   } finally {
     await browser.close();
   }
 }
 
-async function run() {
-  ensureFile(FILES.log, '');
-  ensureFile(FILES.failed, 'reg_no | issue | details\n');
-  ensureFile(FILES.manifest, 'section | count\n');
+async function main() {
+  ensureFile(FILES.failed, "");
+  ensureFile(FILES.log, "");
+  ensureFile(FILES.manifest, "");
 
-  const students = loadPenaltyOutput();
-  const auditMap = loadPenaltyAudit();
+  const calcRows = loadPenaltyCalc().filter(r => (r.status || "").toUpperCase().includes("PENALTY"));
+  const auditMap = loadAudit();
 
-  const summaryHtml = buildSummaryHtml(students, auditMap);
-  const priorityHtml = buildPriorityHtml(students, auditMap);
+  log(`Loaded ${calcRows.length} confirmed penalty students`);
 
-  const oldCache = new Map();
-  let body = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>All Notices</title><style>${css()}</style></head><body>`;
-  body += buildSummaryHtml(students, auditMap).replace(/^<!DOCTYPE html><html><head><meta charset="utf-8"><title>Penalty Summary<\/title><style>[\s\S]*?<\/style><\/head><body>/, '').replace(/<\/body><\/html>$/, '');
-  body += buildPriorityHtml(students, auditMap).replace(/^<!DOCTYPE html><html><head><meta charset="utf-8"><title>Priority Cases<\/title><style>[\s\S]*?<\/style><\/head><body>/, '').replace(/<\/body><\/html>$/, '');
+  const summary = summarize(calcRows, auditMap);
+  fs.writeFileSync(FILES.summaryHtml, renderSummaryPage(summary), "utf8");
+  fs.writeFileSync(FILES.priorityHtml, renderPriorityPage(calcRows, auditMap), "utf8");
 
-  for (let i = 0; i < students.length; i++) {
-    const student = students[i];
-    const auditRows = auditMap.get(student.reg_no) || [];
-    if (!auditRows.length) {
-      fs.appendFileSync(FILES.failed, `${student.reg_no} | AUDIT_MISSING | no audit rows found\n`, 'utf8');
+  const cases = [];
+  const manifest = [];
+
+  for (let i = 0; i < calcRows.length; i++) {
+    const row = calcRows[i];
+    const regNo = row.reg_no;
+    const oldUrl = buildOldUrl(regNo);
+    const newUrl = buildNewUrl(regNo);
+
+    const oldFetched = await fetchWithRetries(oldUrl, false);
+    if (oldFetched.kind !== "FOUND") {
+      fs.appendFileSync(FILES.failed, `${regNo} | OLD_FETCH_FAILED | ${oldUrl}\n`, "utf8");
+      log(`[${i + 1}/${calcRows.length}] ${regNo} -> OLD_FETCH_FAILED`);
       continue;
     }
 
-    let oldMeta = { student_name: '', college_name: '', course_name: '' };
-    let oldRows = [];
-
-    if (oldCache.has(student.old_result_url)) {
-      ({ meta: oldMeta, rows: oldRows } = oldCache.get(student.old_result_url));
-    } else {
-      const fetched = await fetchWithRetries(student.old_result_url);
-      if (fetched.kind !== 'FOUND') {
-        fs.appendFileSync(FILES.failed, `${student.reg_no} | OLD_FETCH_FAIL | ${fetched.error || fetched.kind}\n`, 'utf8');
-      } else {
-        const parsed = parseOldResultMetaAndSubjects(fetched.data);
-        oldMeta = parsed.meta;
-        oldRows = parsed.rows;
-        oldCache.set(student.old_result_url, parsed);
-      }
+    const newFetched = await fetchWithRetries(newUrl, true);
+    if (newFetched.kind !== "FOUND") {
+      fs.appendFileSync(FILES.failed, `${regNo} | NEW_FETCH_FAILED | ${newUrl}\n`, "utf8");
+      log(`[${i + 1}/${calcRows.length}] ${regNo} -> NEW_FETCH_FAILED`);
+      continue;
     }
 
-    body += makeStudentPage(student, auditRows, oldMeta, oldRows);
-    if ((i + 1) % 50 === 0) log(`BUILT ${i + 1}/${students.length} notices`);
+    const oldParsed = parseOldHtml(oldFetched.html);
+    const newParsed = parseNewJson(newFetched.data);
+    const auditRows = auditMap.get(regNo) || [];
+
+    const caseHtml = renderCase(row, auditRows, oldParsed, newParsed);
+    cases.push(caseHtml);
+    manifest.push(`${regNo} | OK | ${oldUrl} | ${newUrl}`);
+
+    log(`[${i + 1}/${calcRows.length}] ${regNo} -> NOTICE_READY`);
+    await sleep(CONFIG.politeDelayMs);
   }
 
-  body += '</body></html>';
-  fs.writeFileSync(FILES.summaryHtml, summaryHtml, 'utf8');
-  fs.writeFileSync(FILES.priorityHtml, priorityHtml, 'utf8');
-  fs.writeFileSync(FILES.allHtml, body, 'utf8');
-  fs.writeFileSync(FILES.manifest, `section | count\nsummary | 1\npriority | 1\nstudent_notices | ${students.length}\n`, 'utf8');
+  const allBody = `
+    <h1>BEU Penalty Comparison Notices</h1>
+    <div class="summary-card">
+      <div><b>Total Cases Rendered:</b> ${esc(cases.length)}</div>
+      <div><b>Old Result Source:</b> ${esc(CONFIG.oldHtmlBase)}</div>
+      <div><b>New Result Source:</b> ${esc(CONFIG.currentResult.year)} / ${esc(CONFIG.currentResult.examHeld)}</div>
+    </div>
+    ${cases.join("\n")}
+  `;
 
-  log('HTML files written. Starting PDF render...');
-  await renderPdf(FILES.allHtml, FILES.allPdf);
-  log('COMPLETE wrote all_notices.html and all_notices.pdf');
+  fs.writeFileSync(FILES.allHtml, buildPage("BEU All Notices", allBody), "utf8");
+  fs.writeFileSync(FILES.manifest, manifest.join("\n") + "\n", "utf8");
+
+  log(`Rendering PDF...`);
+  await renderPdfFromHtml(FILES.allHtml, FILES.pdf);
+  log(`PDF ready: ${FILES.pdf}`);
 }
 
-run().catch(err => {
+main().catch(err => {
   log(`FATAL ${err.stack || err.message}`);
   process.exit(1);
 });
