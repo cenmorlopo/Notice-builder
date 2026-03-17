@@ -433,7 +433,7 @@ function renderCase(row, resolvedRow, auditRows, oldData, newData) {
         </div>
       </div>
 
-      <div class="main-box">
+      <div class="main-box old-result-box">
         <div class="sub-head">
           <span>${esc(oldData.exam_name)} | Semester: ${esc(oldData.semester)} | Examination: ${esc(oldData.exam_held)}</span>
           <a href="${esc(resolvedRow.old_result_url)}">Click here to download</a>
@@ -480,7 +480,7 @@ function renderCase(row, resolvedRow, auditRows, oldData, newData) {
         </div>
       </div>
 
-      <div class="main-box">
+      <div class="main-box new-result-box">
         <div class="sub-head">
           <span>${esc(newData.exam_name)} | Semester: ${esc(newData.semester)} | Examination: ${esc(newData.exam_held)}</span>
           <a href="${esc(resolvedRow.new_result_url)}">Click here to download</a>
@@ -598,6 +598,14 @@ function buildHtmlDocument(content) {
       border:2px solid #111;
       margin-bottom:8px;
       background:#fff;
+    }
+
+    .old-result-box{
+      margin-bottom:8px;
+    }
+
+    .new-result-box{
+      margin-top:12px;
     }
 
     .top-merged{
