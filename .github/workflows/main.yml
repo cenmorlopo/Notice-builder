@@ -1,62 +1,43 @@
-name: Build BEU discrepancy PDF
+name: Build notices
 
 on:
   workflow_dispatch:
 
-concurrency:
-  group: beu-discrepancy-pdf
-  cancel-in-progress: false
-
 jobs:
-  build:
+  build-notices:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Setup Node.js
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: 20
 
       - name: Install dependencies
         run: npm install
 
-      - name: Ensure input files exist
-        run: |
-          test -f penalty_calc_output.txt
-          test -f penalty_audit.txt
-
-      - name: Run builder
-        id: build_step
-        continue-on-error: true
+      - name: Run notice builder
         run: node notice_builder.js
 
-      - name: Commit outputs
-        if: always()
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+      - name: Upload HTML
+        uses: actions/upload-artifact@v4
+        with:
+          name: all_notices_html
+          path: all_notices.html
 
-          for f in all_notices.html all_notices.pdf notice_failed.txt notice_log.txt; do
-            if [ -f "$f" ]; then
-              git add "$f"
-            fi
-          done
+      - name: Upload PDF
+        uses: actions/upload-artifact@v4
+        with:
+          name: all_notices_pdf
+          path: all_notices.pdf
 
-          git diff --cached --quiet && echo "No changes to commit." && exit 0
-
-          git commit -m "Auto-update: BEU discrepancy PDF"
-          git push
-
-      - name: Fail workflow if builder failed
-        if: steps.build_step.outcome == 'failure'
-        run: |
-          echo "Builder failed. Check notice_log.txt and notice_failed.txt in repo."
-          exit 1
+      - name: Upload logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: notice_logs
+          path: |
+            notice_log.txt
+            notice_failed.txt
